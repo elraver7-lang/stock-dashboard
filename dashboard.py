@@ -1019,22 +1019,20 @@ setInterval(refresh,POLL);
 if __name__=='__main__':
     print("="*58)
     print("  USA Stock Dashboard  —  Finnhub Real-Time")
-    print(f"  http://localhost:{PORT}")
+    print(f"  Puerto: {PORT}")
     print(f"  {len(ALL_TICKERS)} tickers  |  WS tiempo real  |  refresh {POLL_MS//1000}s")
-    print("  Ctrl+C para detener.")
     print("="*58)
-    print(f"\nCargando {len(ALL_TICKERS)} tickers (fundamentals)...")
-    load_fundamentals()
-    print("Fundamentals OK ✓")
-    print(f"Cargando indicadores técnicos ({len(ALL_TICKERS)} tickers)...")
-    threading.Thread(target=load_technicals,  daemon=True).start()
-    print(f"Cargando sparklines ({len(ALL_TICKERS)} tickers)...")
-    threading.Thread(target=load_sparklines,  daemon=True).start()
+    # Todos los datos cargan en background — Flask arranca PRIMERO
+    # para que Render/cloud reciba el health-check sin timeout
+    threading.Thread(target=load_fundamentals, daemon=True).start()
+    threading.Thread(target=load_technicals,   daemon=True).start()
+    threading.Thread(target=load_sparklines,   daemon=True).start()
     threading.Thread(target=fundamentals_loop, daemon=True).start()
     threading.Thread(target=technicals_loop,   daemon=True).start()
     threading.Thread(target=sparklines_loop,   daemon=True).start()
     threading.Thread(target=start_ws,          daemon=True).start()
     # Solo abre el navegador si estamos corriendo localmente
     if not os.environ.get("PORT"):
-        threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+        threading.Timer(3.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    print(f"Servidor iniciado en puerto {PORT}. Los datos cargan en ~30s en segundo plano.")
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
