@@ -176,8 +176,8 @@ def load_market_data():
             except Exception:
                 pass
         movers.sort(key=lambda x: x['chgp'], reverse=True)
-        result['top_gainers'] = movers[:10]
-        result['top_losers']  = movers[-10:][::-1]
+        result['top_gainers'] = movers[:15]
+        result['top_losers']  = movers[-15:][::-1]
     except Exception as e:
         print(f"  ✗ top_movers: {e}")
         result['top_gainers'] = []
@@ -1333,8 +1333,8 @@ async function renderMarket(){
     ${pivotHtml(qq.pivots, 'QQQ — Pivots (Floor Method)')}`;
 
   // ── Top movers card ───────────────────────────────────────────────────────
-  const gainers = (mktData.top_gainers||[]).slice(0,10);
-  const losers  = (mktData.top_losers ||[]).slice(0,10);
+  const gainers = (mktData.top_gainers||[]).slice(0,15);
+  const losers  = (mktData.top_losers ||[]).slice(0,15);
   let gainersHtml = '<table class="movers-table">';
   gainers.forEach(m=>{
     gainersHtml += `<tr><td class="movers-ticker">${m.ticker}</td>
