@@ -99,6 +99,68 @@ def _pivot_levels(hist):
     except Exception:
         return None
 
+COUNTRY_FLAGS = {
+    'US':'🇺🇸','EU':'🇪🇺','GB':'🇬🇧','JP':'🇯🇵','CN':'🇨🇳',
+    'DE':'🇩🇪','FR':'🇫🇷','CA':'🇨🇦','AU':'🇦🇺','NZ':'🇳🇿',
+    'CH':'🇨🇭','IT':'🇮🇹','ES':'🇪🇸',
+}
+MAJOR_COUNTRIES = {'US','EU','GB','JP','CN','DE','FR','CA','AU'}
+
+def _fetch_mktnews():
+    """Fetch mktnews flash feed (news + economic indicators)."""
+    ts  = int(time.time() * 1000)
+    url = f'https://static.mktnews.net/json/flash/en.json?t={ts}'
+    r   = requests.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=12)
+    return r.json() if r.status_code == 200 else []
+
+def _parse_mktnews(items):
+    """Split mktnews feed into (news_list, calendar_list)."""
+    news, calendar = [], []
+    for item in (items or []):
+        d = item.get('data') or {}
+        t = item.get('type', 0)
+        if t == 0:
+            content = (d.get('content') or d.get('title') or '').strip()
+            if not content or len(content) < 8:
+                continue
+            impacts = [
+                {'impact': imp.get('impact',''), 'symbol': imp.get('symbol','')}
+                for imp in (item.get('impact') or [])
+                if imp.get('impact') != 'none'
+            ]
+            news.append({
+                'headline':  content[:260],
+                'source':    d.get('source','') or 'MKTNews',
+                'url':       d.get('source_link','') or '#',
+                'image':     d.get('pic','') or '',
+                'datetime':  item.get('time',''),
+                'important': int(item.get('important', 0)),
+                'hot':       bool(item.get('hot', False)),
+                'impacts':   impacts,
+            })
+        elif t == 1:
+            country = (d.get('country_code') or '').upper()
+            if country not in MAJOR_COUNTRIES:
+                continue
+            star = int(d.get('star') or 1)
+            imp  = 'high' if star >= 3 else ('medium' if star == 2 else 'low')
+            calendar.append({
+                'time':    d.get('pub_time',''),
+                'event':   (d.get('title') or d.get('name') or '').strip(),
+                'country': country,
+                'flag':    COUNTRY_FLAGS.get(country, '🌐'),
+                'impact':  imp,
+                'star':    star,
+                'actual':  d.get('actual'),
+                'estimate':d.get('consensus'),
+                'prev':    d.get('previous'),
+                'unit':    d.get('unit','') or '',
+                'affect':  d.get('affect_status','') or '',
+            })
+    news.sort(key=lambda x: x['datetime'], reverse=True)
+    calendar.sort(key=lambda x: x['time'])
+    return news[:25], calendar[:30]
+
 def load_market_data():
     """Load macro market summary: indices, VIX, yields, DXY, sectors, breadth, fear&greed, calendar, movers."""
     print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de mercado...")
@@ -211,31 +273,16 @@ def load_market_data():
         print(f"  ✗ fear_greed: {e}")
         result['fear_greed'] = None
 
-    # ── Economic Calendar (Finnhub) ───────────────────────────────────────────
+    # ── News + Economic Calendar via mktnews.com ──────────────────────────────
     try:
-        now   = datetime.now()
-        cal   = fc.economic_calendar(
-            _from=now.strftime('%Y-%m-%d'),
-            to=(now + timedelta(days=3)).strftime('%Y-%m-%d')
-        )
-        events = []
-        for ev in (cal.get('economicCalendar') or []):
-            if ev.get('country','').upper() != 'US':
-                continue
-            imp = ev.get('impact','')
-            events.append({
-                'time':     ev.get('time',''),
-                'event':    ev.get('event',''),
-                'impact':   imp,
-                'actual':   ev.get('actual'),
-                'estimate': ev.get('estimate'),
-                'prev':     ev.get('prev'),
-                'unit':     ev.get('unit',''),
-            })
-        events.sort(key=lambda x: x['time'])
-        result['econ_calendar'] = events[:20]
+        mktnews_items         = _fetch_mktnews()
+        mkt_news, mkt_cal     = _parse_mktnews(mktnews_items)
+        result['news']        = mkt_news
+        result['econ_calendar'] = mkt_cal
+        print(f"  ✓ mktnews: {len(mkt_news)} noticias, {len(mkt_cal)} eventos de calendario")
     except Exception as e:
-        print(f"  ✗ econ_calendar: {e}")
+        print(f"  ✗ mktnews: {e}")
+        result['news']          = []
         result['econ_calendar'] = []
 
     # ── Earnings Calendar (próximos 14 días para tickers seguidos) ────────────
@@ -317,23 +364,6 @@ def load_market_data():
         print(f"  ✗ top_movers: {e}")
         result['top_gainers'] = []
         result['top_losers']  = []
-
-    # ── Market news ───────────────────────────────────────────────────────────
-    try:
-        news = fc.general_news('general', min_id=0)
-        result['news'] = [
-            {
-                'headline': n.get('headline',''),
-                'source':   n.get('source',''),
-                'url':      n.get('url','#'),
-                'image':    n.get('image',''),
-                'datetime': n.get('datetime',0),
-            }
-            for n in (news or [])[:12]
-        ]
-    except Exception as e:
-        print(f"  ✗ market_news: {e}")
-        result['news'] = []
 
     result['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
     with _lock:
@@ -1498,11 +1528,14 @@ function pivotHtml(pivots, label){
 
 function formatMktTime(ts){
   if(!ts) return '';
-  const d = new Date(ts*1000);
-  const diff = (Date.now()/1000) - ts;
-  if(diff < 3600) return `hace ${Math.round(diff/60)}m`;
+  // accepts Unix timestamp (number) or ISO string
+  const d    = typeof ts==='number' ? new Date(ts*1000) : new Date(ts);
+  const diff = (Date.now() - d.getTime()) / 1000;
+  if(isNaN(diff)) return ts;
+  if(diff < 60)    return 'ahora';
+  if(diff < 3600)  return `hace ${Math.round(diff/60)}m`;
   if(diff < 86400) return `hace ${Math.round(diff/3600)}h`;
-  return `hace ${Math.round(diff/86400)}d`;
+  return d.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit'});
 }
 
 async function renderMarket(){
@@ -1634,28 +1667,39 @@ async function renderMarket(){
     <span style="color:#304050"> (>1.5 presión vendedora · <0.5 compradora)</span>
   </div>`:''}`;
 
-  // ── 6. Economic Calendar ──────────────────────────────────────────────────
+  // ── 6. Economic Calendar (mktnews) ───────────────────────────────────────
   const cal=mktData.econ_calendar||[];
   let calHtml='';
   if(cal.length){
-    calHtml='<div style="display:grid;grid-template-columns:75px 1fr 55px 65px 65px;gap:4px;font-size:.66rem;color:#304050;padding-bottom:4px;border-bottom:1px solid #0e1e2e;margin-bottom:4px"><span>Hora ET</span><span>Evento</span><span>Imp.</span><span style="text-align:right">Estim.</span><span style="text-align:right">Anterior</span></div>';
+    calHtml=`<div style="display:grid;grid-template-columns:30px 110px 1fr 45px 75px 75px 75px;gap:4px;
+      font-size:.65rem;color:#304050;padding-bottom:5px;border-bottom:1px solid #0e1e2e;margin-bottom:4px">
+      <span></span><span>Hora</span><span>Evento</span><span>★</span>
+      <span style="text-align:right">Actual</span>
+      <span style="text-align:right">Estim.</span>
+      <span style="text-align:right">Previo</span>
+    </div>`;
     cal.forEach(e=>{
-      const impCls = e.impact==='high'?'cal-imp-high':e.impact==='medium'?'cal-imp-medium':'cal-imp-low';
       const impIcon = e.impact==='high'?'🔴':e.impact==='medium'?'🟡':'⚪';
-      const timeStr = (e.time||'').substring(11,16)||'—';
-      const actStr  = e.actual!=null?`<span class="cal-act">${e.actual}${e.unit}</span>`:'—';
-      const estStr  = e.estimate!=null?`${e.estimate}${e.unit}`:'—';
-      const prvStr  = e.prev!=null?`${e.prev}${e.unit}`:'—';
-      calHtml+=`<div class="cal-row">
+      const stars   = '★'.repeat(e.star||1)+'☆'.repeat(3-(e.star||1));
+      const timeStr = (e.time||'').replace('T',' ').substring(0,16)||'—';
+      const unit    = e.unit||'';
+      const fmtVal  = v => v!=null ? `${v}${unit}` : '<span class="na">—</span>';
+      const actCls  = e.affect==='POSITIVE'?'cal-act pos':(e.affect==='NEGATIVE'?'neg':'');
+      const actHtml = e.actual!=null
+        ? `<span class="${actCls}">${e.actual}${unit}</span>`
+        : '<span class="na">—</span>';
+      calHtml+=`<div class="cal-row" style="grid-template-columns:30px 110px 1fr 45px 75px 75px 75px">
+        <span title="${e.country}">${e.flag||'🌐'}</span>
         <span class="cal-time">${timeStr}</span>
         <span class="cal-event">${e.event}</span>
-        <span class="${impCls}">${impIcon}</span>
-        <span class="cal-val">${e.actual!=null?actStr:estStr}</span>
-        <span class="cal-val" style="color:#405060">${prvStr}</span>
+        <span class="${e.impact==='high'?'cal-imp-high':e.impact==='medium'?'cal-imp-medium':'cal-imp-low'}" title="${e.impact}">${impIcon}</span>
+        <span class="cal-val">${actHtml}</span>
+        <span class="cal-val" style="color:#506070">${fmtVal(e.estimate)}</span>
+        <span class="cal-val" style="color:#405060">${fmtVal(e.prev)}</span>
       </div>`;
     });
   } else {
-    calHtml='<span class="na" style="font-size:.76rem">Sin eventos económicos próximos para EE.UU.</span>';
+    calHtml='<span class="na" style="font-size:.76rem">Cargando eventos económicos...</span>';
   }
 
   // ── 7. Earnings Calendar ──────────────────────────────────────────────────
@@ -1721,12 +1765,34 @@ async function renderMarket(){
     return h+'</table>';
   };
 
-  // ── 10. News ──────────────────────────────────────────────────────────────
+  // ── 10. News (mktnews) ───────────────────────────────────────────────────
   const news=mktData.news||[];
-  let newsHtml=news.map(n=>`<div class="news-mkt-item">
-    <a class="news-mkt-hl" href="${n.url}" target="_blank" rel="noopener">${n.headline}</a>
-    <span class="news-mkt-meta">${n.source} · ${formatMktTime(n.datetime)}</span>
-  </div>`).join('') || '<span class="na">Sin noticias recientes.</span>';
+  const impactColor={'bullish':'#2ecc71','bearish':'#e74c3c','mixed':'#f0c040'};
+  let newsHtml=news.map(n=>{
+    const hotBadge = n.hot
+      ? '<span style="background:#2a1a00;color:#f0a030;border:1px solid #5a3a00;border-radius:3px;padding:0 5px;font-size:.64rem;font-weight:700;margin-right:5px">🔥 HOT</span>'
+      : '';
+    const impBadge = n.important
+      ? '<span style="background:#2a0a2a;color:#c060e0;border:1px solid #5a1a5a;border-radius:3px;padding:0 5px;font-size:.64rem;font-weight:700;margin-right:5px">⚡ IMPORTANTE</span>'
+      : '';
+    const impactsHtml = (n.impacts||[]).map(i=>{
+      const col = impactColor[i.impact]||'#607080';
+      return `<span style="color:${col};font-size:.64rem;margin-right:6px">${i.impact==='bullish'?'▲':'▼'} ${i.symbol}</span>`;
+    }).join('');
+    const timeStr = n.datetime ? formatMktTime(n.datetime) : '';
+    const srcStr  = n.source ? `<span style="color:#2a6aaa;font-size:.67rem;font-weight:600;background:#0a1e36;padding:1px 5px;border-radius:3px">${n.source}</span>` : '';
+    const linkOpen  = n.url&&n.url!='#' ? `<a class="news-mkt-hl" href="${n.url}" target="_blank" rel="noopener">` : '<span class="news-mkt-hl" style="cursor:default">';
+    const linkClose = n.url&&n.url!='#' ? '</a>' : '</span>';
+    return `<div class="news-mkt-item">
+      ${hotBadge}${impBadge}
+      ${linkOpen}${n.headline}${linkClose}
+      <div class="news-mkt-meta" style="margin-top:3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        ${srcStr}
+        <span style="color:#304050">${timeStr}</span>
+        ${impactsHtml}
+      </div>
+    </div>`;
+  }).join('') || '<span class="na">Cargando noticias...</span>';
 
   // ── Render ────────────────────────────────────────────────────────────────
   document.getElementById('root').innerHTML=`
