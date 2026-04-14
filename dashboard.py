@@ -5,9 +5,10 @@ Uso:  pip install flask finnhub-python websocket-client
 """
 import threading, time, json, webbrowser, os
 from flask import Flask, jsonify, render_template_string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import finnhub, websocket, yfinance as yf
 import pandas as pd
+import requests
 
 API_KEY        = os.environ.get("FINNHUB_API_KEY", "d764qhpr01qm4b7sv75gd764qhpr01qm4b7sv760")
 PORT           = int(os.environ.get("PORT", 5050))
@@ -99,7 +100,7 @@ def _pivot_levels(hist):
         return None
 
 def load_market_data():
-    """Load macro market summary: indices, VIX, yields, DXY, top movers."""
+    """Load macro market summary: indices, VIX, yields, DXY, sectors, breadth, fear&greed, calendar, movers."""
     print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de mercado...")
     result = {}
 
@@ -128,13 +129,10 @@ def load_market_data():
                 'sym': sym, 'price': round(price, 2),
                 'chg': round(chg, 2), 'chgp': chgp,
             }
-
-            # Extra: bias + pivots for SP500 and QQQ
             if key in ('sp500', 'qqq'):
                 hist_4h = None
                 try:
                     hist_4h = t.history(period='60d', interval='1h')
-                    # resample to 4h
                     hist_4h.index = pd.to_datetime(hist_4h.index)
                     hist_4h = hist_4h.resample('4h').agg({
                         'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'
@@ -146,12 +144,154 @@ def load_market_data():
                 result[key]['daily_bias'] = daily_bias
                 result[key]['h4_bias']    = h4_bias
                 result[key]['pivots']     = pivots
-
             time.sleep(0.3)
         except Exception as e:
             print(f"  ✗ market {key}: {e}")
 
-    # ── Top movers (S&P500 sample) ───────────────────────────────────────────
+    # ── Sector ETFs ──────────────────────────────────────────────────────────
+    SECTOR_ETFS = {
+        'XLK':'Tecnología','XLF':'Financiero','XLE':'Energía',
+        'XLV':'Salud','XLB':'Materiales','XLC':'Comunicaciones',
+        'XLI':'Industrial','XLP':'Cons. Básico','XLRE':'Real Estate',
+        'XLU':'Utilities','XLY':'Cons. Discr.',
+    }
+    sectors = []
+    try:
+        for sym, name in SECTOR_ETFS.items():
+            t    = yf.Ticker(sym)
+            hist = t.history(period='5d', interval='1d')
+            if hist.empty: continue
+            price = float(hist['Close'].iloc[-1])
+            prev  = float(hist['Close'].iloc[-2]) if len(hist) > 1 else price
+            chgp  = round(((price - prev) / prev) * 100, 2) if prev else 0
+            sectors.append({'sym': sym, 'name': name, 'price': round(price,2), 'chgp': chgp})
+            time.sleep(0.2)
+        sectors.sort(key=lambda x: x['chgp'], reverse=True)
+    except Exception as e:
+        print(f"  ✗ sectors: {e}")
+    result['sectors'] = sectors
+
+    # ── Market Breadth ───────────────────────────────────────────────────────
+    breadth = {}
+    BREADTH_TICKERS = {
+        'adv':  '^ADVN',   # NYSE Advancing
+        'dec':  '^DECN',   # NYSE Declining
+        'nhigh':'^NAHGH',  # NYSE New Highs
+        'nlow': '^NALOW',  # NYSE New Lows
+        'pcall':'^PCALL',  # CBOE Put/Call Ratio
+        'trin': '^TRIN',   # TRIN (Arms Index)
+    }
+    for key, sym in BREADTH_TICKERS.items():
+        try:
+            hist = yf.Ticker(sym).history(period='5d', interval='1d')
+            if not hist.empty:
+                breadth[key] = round(float(hist['Close'].iloc[-1]), 2)
+            time.sleep(0.2)
+        except Exception:
+            pass
+    result['breadth'] = breadth
+
+    # ── Fear & Greed Index (CNN) ──────────────────────────────────────────────
+    try:
+        r = requests.get(
+            'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=8
+        )
+        fg_data = r.json()
+        fg_score = fg_data.get('fear_and_greed', {}).get('score')
+        fg_rating = fg_data.get('fear_and_greed', {}).get('rating', '')
+        fg_prev   = fg_data.get('fear_and_greed', {}).get('previous_close')
+        result['fear_greed'] = {
+            'score':  round(float(fg_score), 1) if fg_score is not None else None,
+            'rating': fg_rating,
+            'prev':   round(float(fg_prev), 1)  if fg_prev  is not None else None,
+        }
+    except Exception as e:
+        print(f"  ✗ fear_greed: {e}")
+        result['fear_greed'] = None
+
+    # ── Economic Calendar (Finnhub) ───────────────────────────────────────────
+    try:
+        now   = datetime.now()
+        cal   = fc.economic_calendar(
+            _from=now.strftime('%Y-%m-%d'),
+            to=(now + timedelta(days=3)).strftime('%Y-%m-%d')
+        )
+        events = []
+        for ev in (cal.get('economicCalendar') or []):
+            if ev.get('country','').upper() != 'US':
+                continue
+            imp = ev.get('impact','')
+            events.append({
+                'time':     ev.get('time',''),
+                'event':    ev.get('event',''),
+                'impact':   imp,
+                'actual':   ev.get('actual'),
+                'estimate': ev.get('estimate'),
+                'prev':     ev.get('prev'),
+                'unit':     ev.get('unit',''),
+            })
+        events.sort(key=lambda x: x['time'])
+        result['econ_calendar'] = events[:20]
+    except Exception as e:
+        print(f"  ✗ econ_calendar: {e}")
+        result['econ_calendar'] = []
+
+    # ── Earnings Calendar (próximos 14 días para tickers seguidos) ────────────
+    try:
+        now = datetime.now()
+        earnings_raw = fc.earnings_calendar(
+            _from=now.strftime('%Y-%m-%d'),
+            to=(now + timedelta(days=14)).strftime('%Y-%m-%d'),
+            symbol=None, international=False
+        )
+        tracked_set = set(ALL_TICKERS)
+        earnings = []
+        for e in (earnings_raw.get('earningsCalendar') or []):
+            sym = e.get('symbol','')
+            if sym not in tracked_set: continue
+            earnings.append({
+                'ticker': sym,
+                'date':   e.get('date',''),
+                'hour':   e.get('hour',''),          # bmo / amc / dmh
+                'eps_est':e.get('epsEstimate'),
+                'eps_act':e.get('epsActual'),
+                'rev_est':e.get('revenueEstimate'),
+            })
+        earnings.sort(key=lambda x: x['date'])
+        result['earnings'] = earnings
+    except Exception as e:
+        print(f"  ✗ earnings: {e}")
+        result['earnings'] = []
+
+    # ── Pre-market movers ─────────────────────────────────────────────────────
+    pre_movers = []
+    try:
+        pre_batch = yf.download(
+            SP500_SAMPLE, period='2d', interval='1d',
+            prepost=True, group_by='ticker',
+            auto_adjust=True, progress=False, threads=True
+        )
+        for ticker in SP500_SAMPLE:
+            try:
+                if ticker not in pre_batch.columns.get_level_values(0): continue
+                closes = pre_batch[ticker]['Close'].dropna()
+                if len(closes) < 2: continue
+                prev_c = float(closes.iloc[-2])
+                last_c = float(closes.iloc[-1])
+                if prev_c == 0: continue
+                chgp = round(((last_c - prev_c) / prev_c) * 100, 2)
+                if abs(chgp) >= 1.0:
+                    pre_movers.append({'ticker': ticker, 'price': round(last_c,2), 'chgp': chgp})
+            except Exception:
+                pass
+        pre_movers.sort(key=lambda x: abs(x['chgp']), reverse=True)
+    except Exception as e:
+        print(f"  ✗ pre_movers: {e}")
+    result['pre_movers'] = pre_movers[:20]
+
+    # ── Top movers (S&P500 sample — sesión previa) ───────────────────────────
     movers = []
     try:
         batch = yf.download(
@@ -160,17 +300,12 @@ def load_market_data():
         )
         for ticker in SP500_SAMPLE:
             try:
-                if ticker in batch.columns.get_level_values(0):
-                    closes = batch[ticker]['Close'].dropna()
-                else:
-                    continues = True
-                    continue
-                if len(closes) < 2:
-                    continue
+                if ticker not in batch.columns.get_level_values(0): continue
+                closes = batch[ticker]['Close'].dropna()
+                if len(closes) < 2: continue
                 prev_c = float(closes.iloc[-2])
                 last_c = float(closes.iloc[-1])
-                if prev_c == 0:
-                    continue
+                if prev_c == 0: continue
                 chgp = round(((last_c - prev_c) / prev_c) * 100, 2)
                 movers.append({'ticker': ticker, 'price': round(last_c,2), 'chgp': chgp})
             except Exception:
@@ -183,7 +318,7 @@ def load_market_data():
         result['top_gainers'] = []
         result['top_losers']  = []
 
-    # ── Market news (Finnhub general market news) ────────────────────────────
+    # ── Market news ───────────────────────────────────────────────────────────
     try:
         news = fc.general_news('general', min_id=0)
         result['news'] = [
@@ -246,6 +381,15 @@ def load_technicals():
 
             golden = bool(ema50 and ema200 and ema50 > ema200)
 
+            # ATR 14
+            atr14 = None
+            if len(hist_d) >= 15:
+                high = hist_d['High']
+                low  = hist_d['Low']
+                pc   = close_d.shift(1)
+                tr   = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+                atr14 = round(float(tr.ewm(span=14, adjust=False).mean().iloc[-1]), 2)
+
             # composite tech signal: count bullish vs bearish factors
             bulls = sum([
                 rsi_d < 70,                     # not overbought daily
@@ -276,6 +420,7 @@ def load_technicals():
                     'macd_bull':macd_bull,
                     'macd_hist':macd_hist,
                     'signal':   signal,
+                    'atr14':    atr14,
                 }
             print(f"  📊 {ticker:6s}  RSI-D={rsi_d:.0f}  EMA200={'%+.1f%%'%pct_e200 if pct_e200 else '?'}  {'🟢' if signal=='buy' else '🔴' if signal=='sell' else '⚪'}")
             time.sleep(0.3)
@@ -364,6 +509,25 @@ def load_fundamentals():
                     time.sleep(1.0)   # 1 Finnhub call, safe within rate limit
                 except Exception: pass
 
+            # RVOL — relative volume vs 20-day avg, adjusted by time of day
+            avg_vol = info.get('averageVolume') or info.get('averageDailyVolume10Day') or 0
+            cur_vol = info.get('volume') or 0
+            rvol = None
+            if avg_vol > 0 and cur_vol > 0:
+                try:
+                    from datetime import timezone as _tz
+                    import datetime as _dt
+                    et_offset = _dt.timezone(_dt.timedelta(hours=-4))  # EDT
+                    et_now = datetime.now(et_offset)
+                    if et_now.hour >= 9 and (et_now.hour > 9 or et_now.minute >= 30) and et_now.hour < 16:
+                        mins = (et_now.hour - 9) * 60 + et_now.minute - 30
+                        mins = max(mins, 15)
+                        rvol = round(cur_vol / (avg_vol * mins / 390), 2)
+                    else:
+                        rvol = round(cur_vol / avg_vol, 2)
+                except Exception:
+                    rvol = round(cur_vol / avg_vol, 2) if avg_vol else None
+
             with _lock:
                 _info[ticker] = {
                     'name':         (info.get('longName') or info.get('shortName') or ticker)[:34],
@@ -391,6 +555,8 @@ def load_fundamentals():
                     'analyst_hold': analyst_hold,
                     'analyst_sell': analyst_sell,
                     'analyst_score':analyst_score,
+                    'rvol':         rvol,
+                    'avg_volume':   avg_vol,
                 }
                 if price:
                     chg  = round(float(price) - float(prev_close), 2) if prev_close else None
@@ -507,6 +673,9 @@ def api_stocks():
                 'macd_bull':     _tech.get(ticker,{}).get('macd_bull'),
                 'macd_hist':     _tech.get(ticker,{}).get('macd_hist'),
                 'tech_signal':   _tech.get(ticker,{}).get('signal'),
+                'atr14':         _tech.get(ticker,{}).get('atr14'),
+                'rvol':          i.get('rvol'),
+                'avg_volume':    i.get('avg_volume'),
                 'sparkline':     _sparklines.get(ticker, []),
             })
     return jsonify({'data':result,'updated_at':time.strftime("%d/%m/%Y  %H:%M:%S")})
@@ -757,6 +926,64 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .news-mkt-hl:hover{color:#f0c040}
 .news-mkt-meta{font-size:.67rem;color:#304050}
 .mkt-loading{text-align:center;padding:60px;color:#304050;font-size:.9rem}
+
+/* RVOL */
+.rvol-hot  {background:#2a1a00;color:#f0a030;border:1px solid #5a3a00;border-radius:4px;padding:1px 6px;font-weight:700;font-size:.74rem}
+.rvol-high {background:#1a2a00;color:#90d050;border:1px solid #3a5a00;border-radius:4px;padding:1px 6px;font-weight:700;font-size:.74rem}
+.rvol-norm {background:#101e2e;color:#608090;border:1px solid #1e3040;border-radius:4px;padding:1px 6px;font-size:.74rem}
+.rvol-low  {color:#304050;font-size:.74rem}
+
+/* Fear & Greed */
+.fg-meter{display:flex;flex-direction:column;align-items:center;padding:8px 0}
+.fg-score{font-size:2.8rem;font-weight:900;line-height:1}
+.fg-label{font-size:.78rem;font-weight:700;letter-spacing:1px;margin-top:4px}
+.fg-bar-wrap{width:100%;background:#0a1520;border-radius:4px;height:8px;margin-top:8px;overflow:hidden}
+.fg-bar{height:100%;border-radius:4px;transition:width .5s}
+.fg-greed{color:#2ecc71}.fg-fgreed{color:#90d050}
+.fg-neutral{color:#f0c040}
+.fg-fear{color:#e09040}.fg-xfear{color:#e74c3c}
+
+/* Sector heatmap */
+.sector-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px}
+.sector-cell{border-radius:6px;padding:8px 10px;text-align:center}
+.sector-name{font-size:.67rem;color:rgba(255,255,255,.6);margin-bottom:3px}
+.sector-sym{font-size:.7rem;font-weight:700;color:rgba(255,255,255,.4);margin-bottom:2px}
+.sector-chg{font-size:.88rem;font-weight:700}
+
+/* Economic Calendar */
+.cal-row{display:grid;grid-template-columns:75px 1fr 55px 65px 65px;gap:6px;
+  align-items:center;padding:6px 0;border-bottom:1px solid #0e1e2e;font-size:.75rem}
+.cal-row:last-child{border-bottom:none}
+.cal-time{color:#405060;font-size:.72rem}
+.cal-event{color:#b0cce0;font-weight:600}
+.cal-imp-high{color:#e74c3c;font-weight:700;font-size:.68rem}
+.cal-imp-medium{color:#f0c040;font-size:.68rem}
+.cal-imp-low{color:#405060;font-size:.68rem}
+.cal-val{text-align:right;font-size:.72rem}
+.cal-act{color:#2ecc71;font-weight:700}
+
+/* Earnings */
+.earn-row{display:grid;grid-template-columns:55px 75px 45px 85px 85px;gap:6px;
+  align-items:center;padding:5px 0;border-bottom:1px solid #0e1e2e;font-size:.74rem}
+.earn-row:last-child{border-bottom:none}
+.earn-ticker{font-weight:700;color:#60c0e0}
+.earn-date{color:#405060;font-size:.72rem}
+.earn-hour{font-size:.67rem;padding:1px 5px;border-radius:3px}
+.earn-bmo{background:#0a1e36;color:#4a9eff}
+.earn-amc{background:#1a0a2e;color:#9060e0}
+.earn-dmh{background:#101e2e;color:#607080}
+
+/* Pre-market movers */
+.pre-row{display:flex;justify-content:space-between;align-items:center;
+  padding:4px 0;border-bottom:1px solid #0e1e2a;font-size:.76rem}
+.pre-row:last-child{border-bottom:none}
+.pre-ticker{font-weight:700;color:#60c0e0;min-width:50px}
+
+/* Breadth */
+.breadth-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.breadth-item{background:#0a1520;border-radius:6px;padding:8px 10px;text-align:center}
+.breadth-label{font-size:.64rem;color:#304050;margin-bottom:3px}
+.breadth-val{font-size:1.1rem;font-weight:700}
 </style>
 </head>
 <body>
@@ -918,6 +1145,16 @@ function sigCell(sig){
   return'<span class="sig-neutral">— NEUTRAL</span>';
 }
 
+/* ── RVOL cell ── */
+function rvolCell(v){
+  if(v==null) return '<span class="na">—</span>';
+  const rv = v.toFixed(2)+'x';
+  if(v>=3)   return`<span class="rvol-hot">🔥 ${rv}</span>`;
+  if(v>=1.5) return`<span class="rvol-high">⬆ ${rv}</span>`;
+  if(v>=0.8) return`<span class="rvol-norm">${rv}</span>`;
+  return`<span class="rvol-low">${rv}</span>`;
+}
+
 /* ── top pick scoring ── */
 function computeScore(s){
   // Each component normalized 0–10
@@ -992,6 +1229,8 @@ const TABS = {
     {h:'Cambio $',  sk:'chg',        r:(s)=>`<span class="${cls(s.chg)}">${arr(s.chg)}${s.chg!=null?Math.abs(s.chg).toFixed(2):'—'}</span>`},
     {h:'Cambio %',  sk:'chgp',       r:(s)=>`<span class="${cls(s.chgp)}">${arr(s.chgp)}${s.chgp!=null?Math.abs(s.chgp).toFixed(2)+'%':'—'}</span>`},
     {h:'Vol Día',   sk:'volume',     r:(s)=>fVol(s.volume)},
+    {h:'RVOL',      sk:'rvol',       r:(s)=>rvolCell(s.rvol)},
+    {h:'ATR 14',    sk:'atr14',      r:(s)=>s.atr14!=null?`<span class="muted">$${s.atr14.toFixed(2)}</span>`:'<span class="na">—</span>'},
     {h:'Mkt Cap',   sk:'mktcap_b',   r:(s)=>fCap(s.mktcap_b)},
     {h:'vs 52W↑',   sk:'pct_from_52h', r:(s)=>fPct(s.pct_from_52h)},
     {h:'Max Día',   sk:'high_day',   r:(s)=>f(s.high_day,2,'$')},
@@ -1050,6 +1289,8 @@ const TABS = {
     {h:'EMA 50',         sk:'ema50',   r:(s)=>f(s.ema50,2,'$')},
     {h:'EMA 50/200',     sk:'golden',  r:(s)=>crossCell(s.golden)},
     {h:'MACD',           sk:'macd_bull', r:(s)=>macdCell(s.macd_bull, s.macd_hist)},
+    {h:'ATR 14',         sk:'atr14',   r:(s)=>s.atr14!=null?`<span class="muted">$${s.atr14.toFixed(2)}</span>`:'<span class="na">—</span>'},
+    {h:'RVOL',           sk:'rvol',    r:(s)=>rvolCell(s.rvol)},
     {h:'Mkt Cap',        sk:'mktcap_b', r:(s)=>fCap(s.mktcap_b)},
     {h:'Beta',           sk:'beta',    r:(s)=>f(s.beta,2)},
     {h:'vs 52W↑',        sk:'pct_from_52h', r:(s)=>fPct(s.pct_from_52h)},
@@ -1274,99 +1515,223 @@ async function renderMarket(){
     return;
   }
   if(!mktData || Object.keys(mktData).length===0){
-    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Los datos de mercado se están calculando por primera vez (~30s)...</div>';
+    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Los datos de mercado se están calculando por primera vez (~60s)...</div>';
     setTimeout(renderMarket, 8000);
     return;
   }
 
   const INST_META = {
-    sp500: {label:'S&P 500',     name:'SPDR S&P 500'},
-    qqq:   {label:'QQQ',         name:'Invesco QQQ (Nasdaq 100)'},
-    vix:   {label:'VIX',         name:'CBOE Volatility Index'},
-    us10y: {label:'US 10Y',      name:'Tasa 10 años Treasury'},
-    us30y: {label:'US 30Y',      name:'Tasa 30 años Treasury'},
-    dxy:   {label:'DXY',         name:'US Dollar Index Futures'},
-    gold:  {label:'Gold',        name:'Oro Spot ($/oz)'},
-    oil:   {label:'WTI',         name:'Petróleo Crudo WTI'},
+    sp500:{label:'S&P 500', name:'SPDR S&P 500'},
+    qqq:  {label:'QQQ',     name:'Invesco QQQ (Nasdaq 100)'},
+    vix:  {label:'VIX',     name:'CBOE Volatility Index'},
+    us10y:{label:'US 10Y',  name:'Tasa 10 años Treasury'},
+    us30y:{label:'US 30Y',  name:'Tasa 30 años Treasury'},
+    dxy:  {label:'DXY',     name:'US Dollar Index Futures'},
+    gold: {label:'Gold',    name:'Oro ($/oz)'},
+    oil:  {label:'WTI',     name:'Petróleo Crudo WTI'},
   };
 
-  // ── Macro instruments card ────────────────────────────────────────────────
-  let macroRows = '';
-  for(const [key, meta] of Object.entries(INST_META)){
-    const d = mktData[key];
-    if(!d) continue;
-    const noSign = ['vix','us10y','us30y','dxy'].includes(key);
-    const priceStr = noSign ? d.price.toFixed(2) : '$'+d.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
-    const chgCls = d.chgp>=0?'pos':'neg';
-    const chgStr = `${d.chgp>=0?'+':''}${d.chgp.toFixed(2)}%`;
-    const suf = (key==='us10y'||key==='us30y'||key==='vix') ? '' : '';
-    macroRows += `<div class="mkt-inst-row">
+  // ── 1. Macro ──────────────────────────────────────────────────────────────
+  let macroRows='';
+  for(const [key,meta] of Object.entries(INST_META)){
+    const d=mktData[key]; if(!d) continue;
+    const noSign=['vix','us10y','us30y','dxy'].includes(key);
+    const pStr = noSign ? d.price.toFixed(2) : '$'+d.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const suf  = (key==='us10y'||key==='us30y') ? '%' : '';
+    const cc   = d.chgp>=0?'pos':'neg';
+    macroRows+=`<div class="mkt-inst-row">
       <span class="mkt-inst-sym">${meta.label}</span>
       <span class="mkt-inst-name">${meta.name}</span>
-      <span class="mkt-inst-price">${priceStr}${key==='us10y'||key==='us30y'?'%':''}</span>
-      <span class="mkt-inst-chg ${chgCls}">${chgStr}</span>
+      <span class="mkt-inst-price">${pStr}${suf}</span>
+      <span class="mkt-inst-chg ${cc}">${d.chgp>=0?'+':''}${d.chgp.toFixed(2)}%</span>
     </div>`;
   }
 
-  // ── Bias + Pivots card ────────────────────────────────────────────────────
-  const sp = mktData.sp500 || {};
-  const qq = mktData.qqq   || {};
-  const biasHtml = `
-    <div class="bias-row">
-      <span class="bias-sym">SP500</span>
-      <span class="bias-label">4 horas</span>
-      ${biasChip(sp.h4_bias)}
-      <span class="bias-label" style="margin-left:10px">Diario</span>
-      ${biasChip(sp.daily_bias)}
+  // ── 2. Fear & Greed ───────────────────────────────────────────────────────
+  let fgHtml='<span class="na">Sin datos</span>';
+  if(mktData.fear_greed && mktData.fear_greed.score!=null){
+    const fg=mktData.fear_greed;
+    const sc=fg.score;
+    let cls2='fg-neutral', barCol='#f0c040', lbl=fg.rating||'';
+    if(sc>=75){cls2='fg-greed'; barCol='#2ecc71';}
+    else if(sc>=55){cls2='fg-fgreed'; barCol='#90d050';}
+    else if(sc>=45){cls2='fg-neutral'; barCol='#f0c040';}
+    else if(sc>=25){cls2='fg-fear';  barCol='#e09040';}
+    else{cls2='fg-xfear'; barCol='#e74c3c';}
+    const prevStr = fg.prev!=null ? `<div style="font-size:.68rem;color:#405060;margin-top:4px">Anterior cierre: ${fg.prev.toFixed(0)}</div>` : '';
+    fgHtml=`<div class="fg-meter">
+      <div class="fg-score ${cls2}">${sc.toFixed(0)}</div>
+      <div class="fg-label ${cls2}">${lbl.toUpperCase()}</div>
+      <div class="fg-bar-wrap"><div class="fg-bar" style="width:${sc}%;background:${barCol}"></div></div>
+      ${prevStr}
+      <div style="display:flex;justify-content:space-between;width:100%;font-size:.62rem;color:#304050;margin-top:3px">
+        <span>0 Miedo Extremo</span><span>100 Codicia Extrema</span>
+      </div>
+    </div>`;
+  }
+
+  // ── 3. Bias + Pivots ──────────────────────────────────────────────────────
+  const sp=mktData.sp500||{}, qq=mktData.qqq||{};
+  const biasHtml=`
+    <div class="bias-row"><span class="bias-sym">SP500</span>
+      <span class="bias-label">4H</span>${biasChip(sp.h4_bias)}
+      <span class="bias-label" style="margin-left:8px">Diario</span>${biasChip(sp.daily_bias)}
     </div>
-    <div class="bias-row">
-      <span class="bias-sym">QQQ</span>
-      <span class="bias-label">4 horas</span>
-      ${biasChip(qq.h4_bias)}
-      <span class="bias-label" style="margin-left:10px">Diario</span>
-      ${biasChip(qq.daily_bias)}
-    </div>`;
+    <div class="bias-row"><span class="bias-sym">QQQ</span>
+      <span class="bias-label">4H</span>${biasChip(qq.h4_bias)}
+      <span class="bias-label" style="margin-left:8px">Diario</span>${biasChip(qq.daily_bias)}
+    </div>
+    <div style="font-size:.62rem;color:#203040;margin-top:6px">EMA20/50 · RSI · MACD — no constituye consejo de inversión.</div>`;
 
-  const pivotsHtml = `
-    ${pivotHtml(sp.pivots, 'S&P 500 — Pivots (Floor Method)')}
-    <div style="margin-top:10px"></div>
-    ${pivotHtml(qq.pivots, 'QQQ — Pivots (Floor Method)')}`;
+  const pivotsHtml=`
+    ${pivotHtml(sp.pivots,'S&P 500 — Floor Pivots')}
+    <div style="margin-top:8px"></div>
+    ${pivotHtml(qq.pivots,'QQQ — Floor Pivots')}`;
 
-  // ── Top movers card ───────────────────────────────────────────────────────
-  const gainers = (mktData.top_gainers||[]).slice(0,15);
-  const losers  = (mktData.top_losers ||[]).slice(0,15);
-  let gainersHtml = '<table class="movers-table">';
-  gainers.forEach(m=>{
-    gainersHtml += `<tr><td class="movers-ticker">${m.ticker}</td>
-      <td style="text-align:right">$${m.price.toFixed(2)}</td>
-      <td style="text-align:right" class="pos">▲ ${m.chgp.toFixed(2)}%</td></tr>`;
-  });
-  gainersHtml += '</table>';
-
-  let losersHtml = '<table class="movers-table">';
-  losers.forEach(m=>{
-    losersHtml += `<tr><td class="movers-ticker">${m.ticker}</td>
-      <td style="text-align:right">$${m.price.toFixed(2)}</td>
-      <td style="text-align:right" class="neg">▼ ${Math.abs(m.chgp).toFixed(2)}%</td></tr>`;
-  });
-  losersHtml += '</table>';
-
-  // ── News card ─────────────────────────────────────────────────────────────
-  const news = mktData.news || [];
-  let newsHtml = '';
-  news.forEach(n=>{
-    newsHtml += `<div class="news-mkt-item">
-      <a class="news-mkt-hl" href="${n.url}" target="_blank" rel="noopener">${n.headline}</a>
-      <span class="news-mkt-meta">${n.source} · ${formatMktTime(n.datetime)}</span>
+  // ── 4. Sector Heatmap ─────────────────────────────────────────────────────
+  const sectors=mktData.sectors||[];
+  let sectorHtml='<div class="sector-grid">';
+  sectors.forEach(s=>{
+    const pct=s.chgp; const pos=pct>=0;
+    const intensity=Math.min(Math.abs(pct)/3,1);
+    const bg=pos
+      ? `rgba(46,204,113,${0.08+intensity*0.25})`
+      : `rgba(231,76,60,${0.08+intensity*0.25})`;
+    const col=pos?`hsl(145,${40+intensity*50}%,${50+intensity*10}%)`:`hsl(0,${40+intensity*50}%,${55+intensity*10}%)`;
+    sectorHtml+=`<div class="sector-cell" style="background:${bg};border:1px solid ${pos?'rgba(46,204,113,.2)':'rgba(231,76,60,.2)'}">
+      <div class="sector-sym">${s.sym}</div>
+      <div class="sector-name">${s.name}</div>
+      <div class="sector-chg" style="color:${col}">${pct>=0?'+':''}${pct.toFixed(2)}%</div>
     </div>`;
   });
-  if(!newsHtml) newsHtml = '<span class="na">Sin noticias recientes.</span>';
+  sectorHtml+='</div>';
+  if(!sectors.length) sectorHtml='<span class="na">Cargando sectores...</span>';
+
+  // ── 5. Market Breadth ─────────────────────────────────────────────────────
+  const br=mktData.breadth||{};
+  const adRatio = (br.adv&&br.dec) ? (br.adv/(br.adv+br.dec)*100).toFixed(0) : null;
+  const pcRatio  = br.pcall;
+  const pcCls = pcRatio ? (pcRatio>1.1?'pos':(pcRatio<0.7?'neg':'neu')) : '';
+  let breadthHtml=`<div class="breadth-grid">
+    <div class="breadth-item"><div class="breadth-label">NYSE Avances</div>
+      <div class="breadth-val pos">${br.adv!=null?br.adv.toLocaleString():'—'}</div></div>
+    <div class="breadth-item"><div class="breadth-label">NYSE Bajas</div>
+      <div class="breadth-val neg">${br.dec!=null?br.dec.toLocaleString():'—'}</div></div>
+    <div class="breadth-item"><div class="breadth-label">Nuevos Máx 52W</div>
+      <div class="breadth-val pos">${br.nhigh!=null?br.nhigh.toLocaleString():'—'}</div></div>
+    <div class="breadth-item"><div class="breadth-label">Nuevos Mín 52W</div>
+      <div class="breadth-val neg">${br.nlow!=null?br.nlow.toLocaleString():'—'}</div></div>
+  </div>
+  ${adRatio!=null?`<div style="margin-top:8px;font-size:.72rem;color:#607080">
+    Relación Avance/Baja: <strong style="color:${adRatio>=50?'#2ecc71':'#e74c3c'}">${adRatio}% alcistas</strong>
+  </div>`:''}
+  ${pcRatio!=null?`<div style="margin-top:6px;font-size:.72rem;color:#607080">
+    Put/Call Ratio: <strong class="${pcCls}">${pcRatio.toFixed(2)}</strong>
+    <span style="color:#304050"> (>1.1 miedo · <0.7 euforia)</span>
+  </div>`:''}
+  ${br.trin!=null?`<div style="margin-top:4px;font-size:.72rem;color:#607080">
+    TRIN (Arms Index): <strong>${br.trin.toFixed(2)}</strong>
+    <span style="color:#304050"> (>1.5 presión vendedora · <0.5 compradora)</span>
+  </div>`:''}`;
+
+  // ── 6. Economic Calendar ──────────────────────────────────────────────────
+  const cal=mktData.econ_calendar||[];
+  let calHtml='';
+  if(cal.length){
+    calHtml='<div style="display:grid;grid-template-columns:75px 1fr 55px 65px 65px;gap:4px;font-size:.66rem;color:#304050;padding-bottom:4px;border-bottom:1px solid #0e1e2e;margin-bottom:4px"><span>Hora ET</span><span>Evento</span><span>Imp.</span><span style="text-align:right">Estim.</span><span style="text-align:right">Anterior</span></div>';
+    cal.forEach(e=>{
+      const impCls = e.impact==='high'?'cal-imp-high':e.impact==='medium'?'cal-imp-medium':'cal-imp-low';
+      const impIcon = e.impact==='high'?'🔴':e.impact==='medium'?'🟡':'⚪';
+      const timeStr = (e.time||'').substring(11,16)||'—';
+      const actStr  = e.actual!=null?`<span class="cal-act">${e.actual}${e.unit}</span>`:'—';
+      const estStr  = e.estimate!=null?`${e.estimate}${e.unit}`:'—';
+      const prvStr  = e.prev!=null?`${e.prev}${e.unit}`:'—';
+      calHtml+=`<div class="cal-row">
+        <span class="cal-time">${timeStr}</span>
+        <span class="cal-event">${e.event}</span>
+        <span class="${impCls}">${impIcon}</span>
+        <span class="cal-val">${e.actual!=null?actStr:estStr}</span>
+        <span class="cal-val" style="color:#405060">${prvStr}</span>
+      </div>`;
+    });
+  } else {
+    calHtml='<span class="na" style="font-size:.76rem">Sin eventos económicos próximos para EE.UU.</span>';
+  }
+
+  // ── 7. Earnings Calendar ──────────────────────────────────────────────────
+  const earnings=mktData.earnings||[];
+  let earnHtml='';
+  if(earnings.length){
+    earnHtml='<div style="display:grid;grid-template-columns:55px 75px 45px 85px 85px;gap:4px;font-size:.66rem;color:#304050;padding-bottom:4px;border-bottom:1px solid #0e1e2e;margin-bottom:4px"><span>Ticker</span><span>Fecha</span><span>Hora</span><span style="text-align:right">EPS Est.</span><span style="text-align:right">Rev Est.</span></div>';
+    earnings.forEach(e=>{
+      const hourCls=e.hour==='bmo'?'earn-bmo':e.hour==='amc'?'earn-amc':'earn-dmh';
+      const hourLbl=e.hour==='bmo'?'Pre-Mkt':e.hour==='amc'?'Post-Mkt':'Durante';
+      const epsStr=e.eps_est!=null?`$${Number(e.eps_est).toFixed(2)}`:'—';
+      const revStr=e.rev_est!=null?`$${(Number(e.rev_est)/1e9).toFixed(1)}B`:'—';
+      earnHtml+=`<div class="earn-row">
+        <span class="earn-ticker">${e.ticker}</span>
+        <span class="earn-date">${e.date}</span>
+        <span class="earn-hour ${hourCls}">${hourLbl}</span>
+        <span style="text-align:right">${epsStr}</span>
+        <span style="text-align:right;color:#607080">${revStr}</span>
+      </div>`;
+    });
+  } else {
+    earnHtml='<span class="na" style="font-size:.76rem">Sin earnings próximos en tickers seguidos.</span>';
+  }
+
+  // ── 8. Pre-market movers ──────────────────────────────────────────────────
+  const preMov=mktData.pre_movers||[];
+  let preHtml='';
+  if(preMov.length){
+    const preUp=preMov.filter(m=>m.chgp>0).slice(0,8);
+    const preDn=preMov.filter(m=>m.chgp<0).slice(0,8);
+    preHtml=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div>
+        <div style="font-size:.66rem;color:#304050;margin-bottom:4px">▲ SUBIENDO</div>
+        ${preUp.map(m=>`<div class="pre-row">
+          <span class="pre-ticker">${m.ticker}</span>
+          <span style="color:#607080;font-size:.74rem">$${m.price.toFixed(2)}</span>
+          <span class="pos">+${m.chgp.toFixed(2)}%</span>
+        </div>`).join('')}
+      </div>
+      <div>
+        <div style="font-size:.66rem;color:#304050;margin-bottom:4px">▼ BAJANDO</div>
+        ${preDn.map(m=>`<div class="pre-row">
+          <span class="pre-ticker">${m.ticker}</span>
+          <span style="color:#607080;font-size:.74rem">$${m.price.toFixed(2)}</span>
+          <span class="neg">${m.chgp.toFixed(2)}%</span>
+        </div>`).join('')}
+      </div>
+    </div>`;
+  } else {
+    preHtml='<span class="na" style="font-size:.76rem">Sin movers pre-market significativos (&gt;1%).</span>';
+  }
+
+  // ── 9. Top movers ─────────────────────────────────────────────────────────
+  const gainers=(mktData.top_gainers||[]).slice(0,15);
+  const losers =(mktData.top_losers ||[]).slice(0,15);
+  const moverTable=(arr,pos)=>{
+    let h='<table class="movers-table">';
+    arr.forEach(m=>{
+      h+=`<tr><td class="movers-ticker">${m.ticker}</td>
+        <td style="text-align:right;color:#507080">$${m.price.toFixed(2)}</td>
+        <td style="text-align:right" class="${pos?'pos':'neg'}">${pos?'▲':'▼'} ${Math.abs(m.chgp).toFixed(2)}%</td></tr>`;
+    });
+    return h+'</table>';
+  };
+
+  // ── 10. News ──────────────────────────────────────────────────────────────
+  const news=mktData.news||[];
+  let newsHtml=news.map(n=>`<div class="news-mkt-item">
+    <a class="news-mkt-hl" href="${n.url}" target="_blank" rel="noopener">${n.headline}</a>
+    <span class="news-mkt-meta">${n.source} · ${formatMktTime(n.datetime)}</span>
+  </div>`).join('') || '<span class="na">Sin noticias recientes.</span>';
 
   // ── Render ────────────────────────────────────────────────────────────────
-  const updAt = mktData.updated_at || '—';
-  document.getElementById('root').innerHTML = `
+  document.getElementById('root').innerHTML=`
   <div style="padding:6px 18px 0;font-size:.68rem;color:#1e3040;text-align:right">
-    Actualizado: ${updAt} &nbsp;·&nbsp;
+    Actualizado: ${mktData.updated_at||'—'} &nbsp;·&nbsp;
     <span style="cursor:pointer;color:#2a6aaa" onclick="renderMarket()">↻ Refrescar</span>
   </div>
   <div class="mkt-grid">
@@ -1377,27 +1742,54 @@ async function renderMarket(){
     </div>
 
     <div class="mkt-card">
+      <div class="mkt-card-title"><span>😱</span> FEAR &amp; GREED INDEX</div>
+      ${fgHtml}
+    </div>
+
+    <div class="mkt-card">
       <div class="mkt-card-title"><span>🧭</span> BIAS TÉCNICO</div>
       ${biasHtml}
-      <div style="font-size:.63rem;color:#203040;margin-top:8px">
-        Basado en EMA20/50, RSI, MACD. No constituye consejo de inversión.
-      </div>
+    </div>
+
+    <div class="mkt-card" style="grid-column:span 2">
+      <div class="mkt-card-title"><span>🌡️</span> HEATMAP DE SECTORES S&amp;P500</div>
+      ${sectorHtml}
     </div>
 
     <div class="mkt-card">
       <div class="mkt-card-title"><span>📐</span> SOPORTES &amp; RESISTENCIAS</div>
       ${pivotsHtml}
-      <div style="font-size:.62rem;color:#203040;margin-top:6px">Pivots clásicos Floor — basados en OHLC de sesión previa.</div>
+      <div style="font-size:.62rem;color:#203040;margin-top:6px">Pivots clásicos Floor — OHLC sesión previa.</div>
+    </div>
+
+    <div class="mkt-card">
+      <div class="mkt-card-title"><span>📡</span> AMPLITUD DE MERCADO</div>
+      ${breadthHtml}
+    </div>
+
+    <div class="mkt-card" style="grid-column:span 2">
+      <div class="mkt-card-title"><span>🌅</span> PRE-MARKET MOVERS</div>
+      ${preHtml}
     </div>
 
     <div class="mkt-card">
       <div class="mkt-card-title"><span>🟢</span> TOP GAINERS S&amp;P500 (sesión previa)</div>
-      ${gainersHtml}
+      ${moverTable(gainers,true)}
     </div>
 
     <div class="mkt-card">
       <div class="mkt-card-title"><span>🔴</span> TOP LOSERS S&amp;P500 (sesión previa)</div>
-      ${losersHtml}
+      ${moverTable(losers,false)}
+    </div>
+
+    <div class="mkt-card" style="grid-column:span 2">
+      <div class="mkt-card-title"><span>📅</span> CALENDARIO ECONÓMICO — PRÓXIMOS 3 DÍAS (EE.UU.)</div>
+      ${calHtml}
+    </div>
+
+    <div class="mkt-card" style="grid-column:span 2">
+      <div class="mkt-card-title"><span>📢</span> EARNINGS — PRÓXIMAS 2 SEMANAS (TICKERS SEGUIDOS)</div>
+      ${earnHtml}
     </div>
 
     <div class="mkt-card" style="grid-column:span 2">
