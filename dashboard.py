@@ -14,8 +14,8 @@ PORT           = int(os.environ.get("PORT", 5050))
 POLL_MS        = 3000
 FUND_REFRESH_S = 300
 
-REQUESTED   = ["META","GOOGL","MSFT","NVDA","ORCL","MU","NFLX","SPOT","TSLA","NU","PAGS","STNE"]
-RECOMMENDED = ["AMZN","AMD","V","ASML","JPM","BABA","MELI","ADBE","AVGO","QCOM","CRM","MRVL","TXN"]
+REQUESTED   = ["META","GOOGL","MSFT","NVDA","ORCL","MU","NFLX","SPOT","TSLA","NOW","NU","PAGS","STNE"]
+RECOMMENDED = ["AMZN","AMD","V","ASML","JPM","BABA","MELI","ADBE","AVGO","QCOM","CRM","MRVL","TXN","SHOP","UBER","APP","PANW"]
 AI_GROWTH   = ["NBIS","ASTS","ONDS","IREN","RKLB","PLTR","ARM","SMCI","CRWD","NET","ANET","IONQ"]
 ALL_TICKERS = REQUESTED + RECOMMENDED + AI_GROWTH
 
@@ -23,8 +23,192 @@ _prices     = {}
 _info       = {}
 _tech       = {}
 _sparklines = {}   # ticker -> [price, price, ...]
+_market     = {}   # market summary data
 _lock       = threading.Lock()
 fc = finnhub.Client(api_key=API_KEY)
+
+# ── Top S&P500 tickers para top movers ───────────────────────────────────────
+SP500_SAMPLE = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V",
+    "UNH","XOM","MA","LLY","ORCL","HD","COST","BAC","NFLX","ABBV",
+    "CRM","AMD","WMT","CSCO","ACN","MRK","NOW","ADBE","TXN","QCOM",
+    "NEE","IBM","GS","INTU","LIN","AMGN","BKNG","ISRG","SPGI","PANW",
+    "TMO","AXP","PLD","MDT","MCD","RTX","ADI","MU","INTC","GILD",
+    "CVX","SLB","CAT","DE","UPS","LOW","TJX","PGR","REGN","DHR",
+    "SHOP","UBER","APP","PLTR","CRWD","NET","ANET","ARM","MRVL","AVGO",
+    "PYPL","SNAP","PINS","RBLX","COIN","HOOD","SOFI","RIVN","LCID","F",
+    "GE","BA","MMM","HON","ETN","EMR","ROK","PH","DOV","IR"
+]
+
+def _compute_bias(hist_d, hist_4h=None):
+    """Return (daily_bias, h4_bias) as 'long'/'short'/'neutral'"""
+    try:
+        close = hist_d['Close']
+        if len(close) < 50:
+            return 'neutral', 'neutral'
+        price = float(close.iloc[-1])
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        rsi   = round(float(_rsi(close)), 1)
+        macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
+        macd_bull = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+        bulls_d = sum([price > ema20, price > ema50, rsi > 50, macd_bull])
+        bears_d = sum([price < ema20, price < ema50, rsi < 50, not macd_bull])
+        if bulls_d >= 3:   daily_bias = 'long'
+        elif bears_d >= 3: daily_bias = 'short'
+        else:              daily_bias = 'neutral'
+    except Exception:
+        daily_bias = 'neutral'
+        rsi = None
+
+    h4_bias = 'neutral'
+    if hist_4h is not None and not hist_4h.empty and len(hist_4h) >= 20:
+        try:
+            c4 = hist_4h['Close']
+            p4 = float(c4.iloc[-1])
+            e20_4 = float(c4.ewm(span=20, adjust=False).mean().iloc[-1])
+            e50_4 = float(c4.ewm(span=50, adjust=False).mean().iloc[-1])
+            rsi4  = float(_rsi(c4))
+            ml4   = c4.ewm(span=12, adjust=False).mean() - c4.ewm(span=26, adjust=False).mean()
+            ms4   = ml4.ewm(span=9, adjust=False).mean()
+            mb4   = bool(ml4.iloc[-1] > ms4.iloc[-1])
+            bulls4 = sum([p4 > e20_4, p4 > e50_4, rsi4 > 50, mb4])
+            bears4 = sum([p4 < e20_4, p4 < e50_4, rsi4 < 50, not mb4])
+            if bulls4 >= 3:   h4_bias = 'long'
+            elif bears4 >= 3: h4_bias = 'short'
+        except Exception:
+            pass
+
+    return daily_bias, h4_bias
+
+def _pivot_levels(hist):
+    """Classic floor pivot points from last completed candle"""
+    try:
+        row = hist.iloc[-2] if len(hist) > 1 else hist.iloc[-1]
+        H, L, C = float(row['High']), float(row['Low']), float(row['Close'])
+        P  = (H + L + C) / 3
+        R1 = round(2*P - L, 2)
+        S1 = round(2*P - H, 2)
+        R2 = round(P + (H - L), 2)
+        S2 = round(P - (H - L), 2)
+        R3 = round(H + 2*(P - L), 2)
+        S3 = round(L - 2*(H - P), 2)
+        return {'pivot': round(P,2), 'R1':R1,'R2':R2,'R3':R3,'S1':S1,'S2':S2,'S3':S3}
+    except Exception:
+        return None
+
+def load_market_data():
+    """Load macro market summary: indices, VIX, yields, DXY, top movers."""
+    print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de mercado...")
+    result = {}
+
+    # ── Macro instruments ────────────────────────────────────────────────────
+    INSTRUMENTS = {
+        'sp500': '^GSPC',
+        'qqq':   'QQQ',
+        'vix':   '^VIX',
+        'us10y': '^TNX',
+        'us30y': '^TYX',
+        'dxy':   'DX=F',
+        'gold':  'GC=F',
+        'oil':   'CL=F',
+    }
+    for key, sym in INSTRUMENTS.items():
+        try:
+            t    = yf.Ticker(sym)
+            hist = t.history(period='5d', interval='1d')
+            if hist.empty:
+                continue
+            price = float(hist['Close'].iloc[-1])
+            prev  = float(hist['Close'].iloc[-2]) if len(hist) > 1 else price
+            chg   = round(price - prev, 4)
+            chgp  = round((chg / prev) * 100, 2) if prev else 0
+            result[key] = {
+                'sym': sym, 'price': round(price, 2),
+                'chg': round(chg, 2), 'chgp': chgp,
+            }
+
+            # Extra: bias + pivots for SP500 and QQQ
+            if key in ('sp500', 'qqq'):
+                hist_4h = None
+                try:
+                    hist_4h = t.history(period='60d', interval='1h')
+                    # resample to 4h
+                    hist_4h.index = pd.to_datetime(hist_4h.index)
+                    hist_4h = hist_4h.resample('4h').agg({
+                        'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'
+                    }).dropna()
+                except Exception:
+                    hist_4h = None
+                daily_bias, h4_bias = _compute_bias(hist, hist_4h)
+                pivots = _pivot_levels(hist)
+                result[key]['daily_bias'] = daily_bias
+                result[key]['h4_bias']    = h4_bias
+                result[key]['pivots']     = pivots
+
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"  ✗ market {key}: {e}")
+
+    # ── Top movers (S&P500 sample) ───────────────────────────────────────────
+    movers = []
+    try:
+        batch = yf.download(
+            SP500_SAMPLE, period='2d', interval='1d',
+            group_by='ticker', auto_adjust=True, progress=False, threads=True
+        )
+        for ticker in SP500_SAMPLE:
+            try:
+                if ticker in batch.columns.get_level_values(0):
+                    closes = batch[ticker]['Close'].dropna()
+                else:
+                    continues = True
+                    continue
+                if len(closes) < 2:
+                    continue
+                prev_c = float(closes.iloc[-2])
+                last_c = float(closes.iloc[-1])
+                if prev_c == 0:
+                    continue
+                chgp = round(((last_c - prev_c) / prev_c) * 100, 2)
+                movers.append({'ticker': ticker, 'price': round(last_c,2), 'chgp': chgp})
+            except Exception:
+                pass
+        movers.sort(key=lambda x: x['chgp'], reverse=True)
+        result['top_gainers'] = movers[:10]
+        result['top_losers']  = movers[-10:][::-1]
+    except Exception as e:
+        print(f"  ✗ top_movers: {e}")
+        result['top_gainers'] = []
+        result['top_losers']  = []
+
+    # ── Market news (Finnhub general market news) ────────────────────────────
+    try:
+        news = fc.general_news('general', min_id=0)
+        result['news'] = [
+            {
+                'headline': n.get('headline',''),
+                'source':   n.get('source',''),
+                'url':      n.get('url','#'),
+                'image':    n.get('image',''),
+                'datetime': n.get('datetime',0),
+            }
+            for n in (news or [])[:12]
+        ]
+    except Exception as e:
+        print(f"  ✗ market_news: {e}")
+        result['news'] = []
+
+    result['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
+    with _lock:
+        _market.update(result)
+    print(f"[{time.strftime('%H:%M:%S')}] Datos de mercado listos ✓")
+
+def market_loop():
+    while True:
+        time.sleep(300)   # refresh cada 5 min
+        load_market_data()
 
 # ── technical helpers ─────────────────────────────────────────────────────────
 def _rsi(series, period=14):
@@ -327,6 +511,11 @@ def api_stocks():
             })
     return jsonify({'data':result,'updated_at':time.strftime("%d/%m/%Y  %H:%M:%S")})
 
+@app.route('/api/market')
+def api_market():
+    with _lock:
+        return jsonify(dict(_market))
+
 @app.route('/api/news/<ticker>')
 def api_news(ticker):
     if ticker not in ALL_TICKERS:
@@ -531,6 +720,43 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .sig-buy    {background:#0a2818;color:#2ecc71;border:1px solid #1a5828;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 .sig-sell   {background:#280a0a;color:#e74c3c;border:1px solid #581a1a;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 .sig-neutral{background:#101e2e;color:#7a9aba;border:1px solid #1e3040;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
+
+/* ── Resumen Diario ─────────────────────────────────────────────── */
+.mkt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;padding:16px 18px}
+.mkt-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px}
+.mkt-card-title{font-size:.68rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  color:#4a7890;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.mkt-card-title span{font-size:.75rem}
+.mkt-inst-row{display:flex;justify-content:space-between;align-items:center;
+  padding:5px 0;border-bottom:1px solid #0e1e2a}
+.mkt-inst-row:last-child{border-bottom:none}
+.mkt-inst-sym{font-weight:700;font-size:.82rem;color:#60c0e0;min-width:60px}
+.mkt-inst-name{font-size:.7rem;color:#405060;flex:1;padding:0 8px}
+.mkt-inst-price{font-weight:700;font-size:.88rem;color:#dce8f0;min-width:70px;text-align:right}
+.mkt-inst-chg{font-size:.78rem;min-width:65px;text-align:right;font-weight:600}
+.bias-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px}
+.bias-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #0e1e2a}
+.bias-row:last-child{border-bottom:none}
+.bias-sym{font-weight:700;color:#60c0e0;font-size:.84rem;min-width:55px}
+.bias-label{font-size:.72rem;color:#405060;min-width:50px}
+.bias-long  {background:#0a2818;color:#2ecc71;border:1px solid #1a5828;border-radius:6px;padding:2px 10px;font-weight:700;font-size:.76rem}
+.bias-short {background:#280a0a;color:#e74c3c;border:1px solid #581a1a;border-radius:6px;padding:2px 10px;font-weight:700;font-size:.76rem}
+.bias-neutral{background:#101e2e;color:#7a9aba;border:1px solid #1e3040;border-radius:6px;padding:2px 10px;font-weight:700;font-size:.76rem}
+.pivot-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:6px}
+.pivot-item{text-align:center;padding:4px 0}
+.pivot-item .plabel{font-size:.62rem;color:#304050}
+.pivot-item .pval  {font-size:.78rem;font-weight:700}
+.pivot-item.res .pval{color:#e74c3c}.pivot-item.sup .pval{color:#2ecc71}.pivot-item.pvt .pval{color:#f0c040}
+.movers-table{width:100%;border-collapse:collapse}
+.movers-table td{padding:4px 6px;font-size:.76rem;border-bottom:1px solid #0e1e2a}
+.movers-table tr:last-child td{border-bottom:none}
+.movers-ticker{font-weight:700;color:#60c0e0}
+.news-mkt-item{padding:8px 0;border-bottom:1px solid #0e1e2a}
+.news-mkt-item:last-child{border-bottom:none}
+.news-mkt-hl{font-size:.78rem;font-weight:600;color:#b0cce0;text-decoration:none;display:block;line-height:1.4;margin-bottom:3px}
+.news-mkt-hl:hover{color:#f0c040}
+.news-mkt-meta{font-size:.67rem;color:#304050}
+.mkt-loading{text-align:center;padding:60px;color:#304050;font-size:.9rem}
 </style>
 </head>
 <body>
@@ -561,6 +787,7 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   <div class="tab" onclick="setTab('growth',this)">📈 Crecimiento</div>
   <div class="tab" onclick="setTab('analysts',this)">🎯 Analistas</div>
   <div class="tab" onclick="setTab('technical',this)">📉 Técnico</div>
+  <div class="tab" onclick="setTab('market',this)">🌍 Resumen Diario</div>
 </div>
 
 <div class="legend">
@@ -858,7 +1085,8 @@ function setGroup(g,btn){
 function setTab(t,el){
   activeTab=t; sortCol=null;
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
-  el.classList.add('active'); renderAll();
+  el.classList.add('active');
+  if(t==='market') renderMarket(); else renderAll();
 }
 function sortBy(k){
   if(sortCol===k)sortDir*=-1; else{sortCol=k;sortDir=1;}
@@ -996,6 +1224,190 @@ function closeNews(){
   newsOpen=false;
 }
 
+/* ── Market Summary helpers ── */
+let mktData = null;
+
+function biasChip(b){
+  if(b==='long')    return '<span class="bias-long">▲ LONG</span>';
+  if(b==='short')   return '<span class="bias-short">▼ SHORT</span>';
+  return '<span class="bias-neutral">— NEUTRAL</span>';
+}
+
+function fInst(v, sym){
+  // For yields and DXY omit $ sign
+  const noSign = ['vix','us10y','us30y','dxy'].includes(sym);
+  if(v==null) return '<span class="na">—</span>';
+  return noSign ? v.toFixed(2) : '$'+v.toFixed(2);
+}
+
+function pivotHtml(pivots, label){
+  if(!pivots) return '<span class="na" style="font-size:.72rem">Sin datos</span>';
+  return `<div style="margin-top:4px">
+    <div style="font-size:.65rem;color:#304050;margin-bottom:4px">${label}</div>
+    <div class="pivot-grid">
+      <div class="pivot-item res"><div class="plabel">R3</div><div class="pval">${pivots.R3.toFixed(1)}</div></div>
+      <div class="pivot-item res"><div class="plabel">R2</div><div class="pval">${pivots.R2.toFixed(1)}</div></div>
+      <div class="pivot-item res"><div class="plabel">R1</div><div class="pval">${pivots.R1.toFixed(1)}</div></div>
+      <div class="pivot-item pvt"><div class="plabel">Pivot</div><div class="pval">${pivots.pivot.toFixed(1)}</div></div>
+      <div class="pivot-item sup"><div class="plabel">S1</div><div class="pval">${pivots.S1.toFixed(1)}</div></div>
+      <div class="pivot-item sup"><div class="plabel">S2</div><div class="pval">${pivots.S2.toFixed(1)}</div></div>
+    </div>
+  </div>`;
+}
+
+function formatMktTime(ts){
+  if(!ts) return '';
+  const d = new Date(ts*1000);
+  const diff = (Date.now()/1000) - ts;
+  if(diff < 3600) return `hace ${Math.round(diff/60)}m`;
+  if(diff < 86400) return `hace ${Math.round(diff/3600)}h`;
+  return `hace ${Math.round(diff/86400)}d`;
+}
+
+async function renderMarket(){
+  document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Cargando resumen de mercado...</div>';
+  try{
+    const j = await(await fetch('/api/market')).json();
+    mktData = j;
+  } catch(e){
+    document.getElementById('root').innerHTML=`<div class="mkt-loading">Error cargando datos: ${e.message}</div>`;
+    return;
+  }
+  if(!mktData || Object.keys(mktData).length===0){
+    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Los datos de mercado se están calculando por primera vez (~30s)...</div>';
+    setTimeout(renderMarket, 8000);
+    return;
+  }
+
+  const INST_META = {
+    sp500: {label:'S&P 500',     name:'SPDR S&P 500'},
+    qqq:   {label:'QQQ',         name:'Invesco QQQ (Nasdaq 100)'},
+    vix:   {label:'VIX',         name:'CBOE Volatility Index'},
+    us10y: {label:'US 10Y',      name:'Tasa 10 años Treasury'},
+    us30y: {label:'US 30Y',      name:'Tasa 30 años Treasury'},
+    dxy:   {label:'DXY',         name:'US Dollar Index Futures'},
+    gold:  {label:'Gold',        name:'Oro Spot ($/oz)'},
+    oil:   {label:'WTI',         name:'Petróleo Crudo WTI'},
+  };
+
+  // ── Macro instruments card ────────────────────────────────────────────────
+  let macroRows = '';
+  for(const [key, meta] of Object.entries(INST_META)){
+    const d = mktData[key];
+    if(!d) continue;
+    const noSign = ['vix','us10y','us30y','dxy'].includes(key);
+    const priceStr = noSign ? d.price.toFixed(2) : '$'+d.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const chgCls = d.chgp>=0?'pos':'neg';
+    const chgStr = `${d.chgp>=0?'+':''}${d.chgp.toFixed(2)}%`;
+    const suf = (key==='us10y'||key==='us30y'||key==='vix') ? '' : '';
+    macroRows += `<div class="mkt-inst-row">
+      <span class="mkt-inst-sym">${meta.label}</span>
+      <span class="mkt-inst-name">${meta.name}</span>
+      <span class="mkt-inst-price">${priceStr}${key==='us10y'||key==='us30y'?'%':''}</span>
+      <span class="mkt-inst-chg ${chgCls}">${chgStr}</span>
+    </div>`;
+  }
+
+  // ── Bias + Pivots card ────────────────────────────────────────────────────
+  const sp = mktData.sp500 || {};
+  const qq = mktData.qqq   || {};
+  const biasHtml = `
+    <div class="bias-row">
+      <span class="bias-sym">SP500</span>
+      <span class="bias-label">4 horas</span>
+      ${biasChip(sp.h4_bias)}
+      <span class="bias-label" style="margin-left:10px">Diario</span>
+      ${biasChip(sp.daily_bias)}
+    </div>
+    <div class="bias-row">
+      <span class="bias-sym">QQQ</span>
+      <span class="bias-label">4 horas</span>
+      ${biasChip(qq.h4_bias)}
+      <span class="bias-label" style="margin-left:10px">Diario</span>
+      ${biasChip(qq.daily_bias)}
+    </div>`;
+
+  const pivotsHtml = `
+    ${pivotHtml(sp.pivots, 'S&P 500 — Pivots (Floor Method)')}
+    <div style="margin-top:10px"></div>
+    ${pivotHtml(qq.pivots, 'QQQ — Pivots (Floor Method)')}`;
+
+  // ── Top movers card ───────────────────────────────────────────────────────
+  const gainers = (mktData.top_gainers||[]).slice(0,10);
+  const losers  = (mktData.top_losers ||[]).slice(0,10);
+  let gainersHtml = '<table class="movers-table">';
+  gainers.forEach(m=>{
+    gainersHtml += `<tr><td class="movers-ticker">${m.ticker}</td>
+      <td style="text-align:right">$${m.price.toFixed(2)}</td>
+      <td style="text-align:right" class="pos">▲ ${m.chgp.toFixed(2)}%</td></tr>`;
+  });
+  gainersHtml += '</table>';
+
+  let losersHtml = '<table class="movers-table">';
+  losers.forEach(m=>{
+    losersHtml += `<tr><td class="movers-ticker">${m.ticker}</td>
+      <td style="text-align:right">$${m.price.toFixed(2)}</td>
+      <td style="text-align:right" class="neg">▼ ${Math.abs(m.chgp).toFixed(2)}%</td></tr>`;
+  });
+  losersHtml += '</table>';
+
+  // ── News card ─────────────────────────────────────────────────────────────
+  const news = mktData.news || [];
+  let newsHtml = '';
+  news.forEach(n=>{
+    newsHtml += `<div class="news-mkt-item">
+      <a class="news-mkt-hl" href="${n.url}" target="_blank" rel="noopener">${n.headline}</a>
+      <span class="news-mkt-meta">${n.source} · ${formatMktTime(n.datetime)}</span>
+    </div>`;
+  });
+  if(!newsHtml) newsHtml = '<span class="na">Sin noticias recientes.</span>';
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  const updAt = mktData.updated_at || '—';
+  document.getElementById('root').innerHTML = `
+  <div style="padding:6px 18px 0;font-size:.68rem;color:#1e3040;text-align:right">
+    Actualizado: ${updAt} &nbsp;·&nbsp;
+    <span style="cursor:pointer;color:#2a6aaa" onclick="renderMarket()">↻ Refrescar</span>
+  </div>
+  <div class="mkt-grid">
+
+    <div class="mkt-card" style="grid-column:span 2">
+      <div class="mkt-card-title"><span>📊</span> ÍNDICES · TASAS · MACRO</div>
+      ${macroRows}
+    </div>
+
+    <div class="mkt-card">
+      <div class="mkt-card-title"><span>🧭</span> BIAS TÉCNICO</div>
+      ${biasHtml}
+      <div style="font-size:.63rem;color:#203040;margin-top:8px">
+        Basado en EMA20/50, RSI, MACD. No constituye consejo de inversión.
+      </div>
+    </div>
+
+    <div class="mkt-card">
+      <div class="mkt-card-title"><span>📐</span> SOPORTES &amp; RESISTENCIAS</div>
+      ${pivotsHtml}
+      <div style="font-size:.62rem;color:#203040;margin-top:6px">Pivots clásicos Floor — basados en OHLC de sesión previa.</div>
+    </div>
+
+    <div class="mkt-card">
+      <div class="mkt-card-title"><span>🟢</span> TOP GAINERS S&amp;P500 (sesión previa)</div>
+      ${gainersHtml}
+    </div>
+
+    <div class="mkt-card">
+      <div class="mkt-card-title"><span>🔴</span> TOP LOSERS S&amp;P500 (sesión previa)</div>
+      ${losersHtml}
+    </div>
+
+    <div class="mkt-card" style="grid-column:span 2">
+      <div class="mkt-card-title"><span>📰</span> NOTICIAS DE MERCADO</div>
+      ${newsHtml}
+    </div>
+
+  </div>`;
+}
+
 /* ── fetch ── */
 async function refresh(){
   try{
@@ -1006,12 +1418,13 @@ async function refresh(){
     if(liveN>0){lel.textContent=`🟢 LIVE ${liveN}/${j.data.length}`;lel.style.display='';}
     else lel.style.display='none';
     document.getElementById('updated').textContent=j.updated_at;
-    renderAll();
+    if(activeTab!=='market') renderAll();
   }catch(e){document.getElementById('updated').textContent='Error: '+e.message;}
 }
 
 refresh();
 setInterval(refresh,POLL);
+setInterval(()=>{ if(activeTab==='market') renderMarket(); }, 60000);
 </script>
 </body>
 </html>"""
@@ -1027,9 +1440,11 @@ if __name__=='__main__':
     threading.Thread(target=load_fundamentals, daemon=True).start()
     threading.Thread(target=load_technicals,   daemon=True).start()
     threading.Thread(target=load_sparklines,   daemon=True).start()
+    threading.Thread(target=load_market_data,  daemon=True).start()
     threading.Thread(target=fundamentals_loop, daemon=True).start()
     threading.Thread(target=technicals_loop,   daemon=True).start()
     threading.Thread(target=sparklines_loop,   daemon=True).start()
+    threading.Thread(target=market_loop,       daemon=True).start()
     threading.Thread(target=start_ws,          daemon=True).start()
     # Solo abre el navegador si estamos corriendo localmente
     if not os.environ.get("PORT"):
