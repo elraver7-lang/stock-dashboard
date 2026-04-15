@@ -20,11 +20,47 @@ RECOMMENDED = ["AMZN","AMD","V","ASML","JPM","BABA","MELI","ADBE","AVGO","QCOM",
 AI_GROWTH   = ["NBIS","ASTS","ONDS","IREN","RKLB","PLTR","ARM","SMCI","CRWD","NET","ANET","IONQ"]
 ALL_TICKERS = REQUESTED + RECOMMENDED + AI_GROWTH
 
+# ── Materias Primas & Mineras ─────────────────────────────────────────────────
+COMMODITY_ITEMS = [
+    # ── Materias primas (Futuros / ETFs puros) ──
+    ('GC=F',  'Oro Futuros',              'gold'),
+    ('GLD',   'SPDR Gold ETF',            'gold'),
+    ('SI=F',  'Plata Futuros',            'silver'),
+    ('SLV',   'iShares Silver ETF',       'silver'),
+    ('HG=F',  'Cobre Futuros ($/lb)',     'copper'),
+    ('COPX',  'Global X Copper Miners ETF','copper'),
+    ('URA',   'Global X Uranium ETF',     'uranium'),
+    # ── Mineras de Oro ──
+    ('GDX',   'VanEck Gold Miners ETF',   'gold-miner'),
+    ('NEM',   'Newmont Corp',             'gold-miner'),
+    ('GOLD',  'Barrick Gold',             'gold-miner'),
+    ('AEM',   'Agnico Eagle Mines',       'gold-miner'),
+    ('WPM',   'Wheaton Precious Metals',  'gold-miner'),
+    ('KGC',   'Kinross Gold',             'gold-miner'),
+    # ── Mineras de Plata ──
+    ('PAAS',  'Pan American Silver',      'silver-miner'),
+    ('AG',    'First Majestic Silver',    'silver-miner'),
+    # ── Mineras de Cobre ──
+    ('FCX',   'Freeport-McMoRan',         'copper-miner'),
+    ('SCCO',  'Southern Copper Corp',     'copper-miner'),
+    ('TECK',  'Teck Resources',           'copper-miner'),
+    # ── Mineras de Uranio ──
+    ('CCJ',   'Cameco Corp',              'uranium-miner'),
+    ('NXE',   'NexGen Energy',            'uranium-miner'),
+    ('UEC',   'Uranium Energy Corp',      'uranium-miner'),
+    # ── Mineras Diversificadas ──
+    ('VALE',  'Vale SA',                  'diversified'),
+    ('RIO',   'Rio Tinto',                'diversified'),
+    ('BHP',   'BHP Group',                'diversified'),
+    ('CLF',   'Cleveland-Cliffs',         'diversified'),
+]
+
 _prices     = {}
 _info       = {}
 _tech       = {}
 _sparklines = {}   # ticker -> [price, price, ...]
 _market     = {}   # market summary data
+_mining     = {}   # mining/commodities data
 _lock       = threading.Lock()
 fc = finnhub.Client(api_key=API_KEY)
 
@@ -440,6 +476,95 @@ def market_loop():
         time.sleep(300)   # refresh cada 5 min
         load_market_data()
 
+def load_mining_data():
+    """Fetch prices, 30d range, 52w range, RSI-14, ATR-14 for commodities & miners."""
+    print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de materias primas y mineras...")
+    items_out = []
+    for ticker, name, asset_type in COMMODITY_ITEMS:
+        try:
+            t    = yf.Ticker(ticker)
+            hist = t.history(period='1y', interval='1d')
+            if hist.empty or len(hist) < 5:
+                continue
+            close  = hist['Close']
+            price  = float(close.iloc[-1])
+            prev   = float(close.iloc[-2]) if len(close) > 1 else price
+            chg    = round(price - prev, 6)
+            chgp   = round((chg / prev) * 100, 2) if prev else 0
+
+            # ── 30-day range ────────────────────────────────────────────────
+            h30    = hist.tail(30)
+            hi30   = float(h30['High'].max())
+            lo30   = float(h30['Low'].min())
+            d30h   = round(((price - hi30) / hi30) * 100, 1) if hi30 else None  # ≤0
+            d30l   = round(((price - lo30) / lo30) * 100, 1) if lo30 else None  # ≥0
+            # position in 30d range 0=min 100=max
+            rng30  = hi30 - lo30
+            pos30  = round(((price - lo30) / rng30) * 100, 1) if rng30 > 0 else 50
+
+            # ── 52-week range ───────────────────────────────────────────────
+            hi52   = float(hist['High'].max())
+            lo52   = float(hist['Low'].min())
+            d52h   = round(((price - hi52) / hi52) * 100, 1) if hi52 else None
+            rng52  = hi52 - lo52
+            pos52  = round(((price - lo52) / rng52) * 100, 1) if rng52 > 0 else 50
+
+            # ── RSI-14 ──────────────────────────────────────────────────────
+            rsi = round(float(_rsi(close)), 1) if len(close) >= 15 else None
+
+            # ── ATR-14 ──────────────────────────────────────────────────────
+            atr14 = None
+            atr_pct = None
+            if len(hist) >= 15:
+                hi = hist['High']; lo2 = hist['Low']; pc = close.shift(1)
+                tr  = pd.concat([hi - lo2, (hi - pc).abs(), (lo2 - pc).abs()], axis=1).max(axis=1)
+                atr14   = round(float(tr.ewm(span=14, adjust=False).mean().iloc[-1]), 4)
+                atr_pct = round((atr14 / price) * 100, 2) if price else None
+
+            # ── Volume (only stocks/ETFs, not futures) ──────────────────────
+            volume = None
+            if '=F' not in ticker:
+                try:
+                    volume = int(hist['Volume'].iloc[-1])
+                except Exception:
+                    pass
+
+            items_out.append({
+                'ticker':  ticker,
+                'name':    name,
+                'type':    asset_type,
+                'price':   round(price, 4),
+                'chg':     round(chg, 4),
+                'chgp':    chgp,
+                'hi30':    round(hi30, 4),
+                'lo30':    round(lo30, 4),
+                'd30h':    d30h,
+                'd30l':    d30l,
+                'pos30':   pos30,
+                'hi52':    round(hi52, 4),
+                'lo52':    round(lo52, 4),
+                'd52h':    d52h,
+                'pos52':   pos52,
+                'rsi14':   rsi,
+                'atr14':   atr14,
+                'atr_pct': atr_pct,
+                'volume':  volume,
+            })
+            print(f"  ✓ {ticker:6s}  ${price:.3f}  RSI={rsi}  ATR%={atr_pct}")
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"  ✗ mining {ticker}: {e}")
+
+    with _lock:
+        _mining['items']      = items_out
+        _mining['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
+    print(f"[{time.strftime('%H:%M:%S')}] Materias primas listas: {len(items_out)} activos ✓")
+
+def mining_loop():
+    while True:
+        time.sleep(600)   # refresh cada 10 min
+        load_mining_data()
+
 # ── technical helpers ─────────────────────────────────────────────────────────
 def _rsi(series, period=14):
     delta = series.diff()
@@ -780,6 +905,11 @@ def api_market():
     with _lock:
         return jsonify(dict(_market))
 
+@app.route('/api/mining')
+def api_mining():
+    with _lock:
+        return jsonify(dict(_mining))
+
 @app.route('/api/news/<ticker>')
 def api_news(ticker):
     if ticker not in ALL_TICKERS:
@@ -985,6 +1115,36 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .sig-sell   {background:#280a0a;color:#e74c3c;border:1px solid #581a1a;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 .sig-neutral{background:#101e2e;color:#7a9aba;border:1px solid #1e3040;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 
+/* ── Materias Primas ─────────────────────────────────────────────── */
+.mining-wrap{padding:10px 18px 24px}
+.mining-section{margin-bottom:18px}
+.mining-section-title{font-size:.72rem;font-weight:700;letter-spacing:1.5px;color:#2a6aaa;text-transform:uppercase;padding:6px 0 4px;border-bottom:1px solid #0e2030;margin-bottom:4px}
+.mining-table{width:100%;border-collapse:collapse;font-size:.78rem}
+.mining-table th{color:#304a60;font-size:.65rem;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:5px 8px;border-bottom:1px solid #0e2030;white-space:nowrap}
+.mining-table th.r{text-align:right}
+.mining-table td{padding:5px 8px;border-bottom:1px solid #091520;white-space:nowrap;vertical-align:middle}
+.mining-table tr:hover td{background:#0d1d2c}
+.mining-table td.r{text-align:right}
+.m-ticker{font-weight:700;color:#90b8d0;font-size:.82rem}
+.m-name{color:#304050;font-size:.68rem}
+.m-price{font-weight:600;color:#c8d8e8;font-family:monospace}
+.m-chg-pos{color:#2ecc71;font-size:.76rem}
+.m-chg-neg{color:#e74c3c;font-size:.76rem}
+.m-badge{font-size:.60rem;padding:1px 5px;border-radius:3px;font-weight:700;margin-left:3px}
+.m-badge-gold{background:#2a1e05;color:#f0c040;border:1px solid #3a2e10}
+.m-badge-silver{background:#151e2a;color:#a0b8d0;border:1px solid #253040}
+.m-badge-copper{background:#1e1205;color:#e08050;border:1px solid #2e2010}
+.m-badge-uranium{background:#0a1a0a;color:#50d050;border:1px solid #103010}
+.m-badge-miner{background:#0a1420;color:#6090b0;border:1px solid #1a2a3a}
+.m-badge-div{background:#100f20;color:#9080c0;border:1px solid #201f30}
+.range30-bar{display:inline-block;width:60px;height:6px;background:#0a1520;border-radius:3px;vertical-align:middle;position:relative;overflow:hidden}
+.range30-fill{position:absolute;top:0;left:0;height:100%;border-radius:3px;background:linear-gradient(90deg,#e74c3c,#f0c040,#2ecc71)}
+.rsi-ob{color:#e74c3c;font-weight:700}
+.rsi-os{color:#2ecc71;font-weight:700}
+.rsi-mid{color:#a0b8c8}
+.d-neg{color:#e74c3c}.d-pos{color:#2ecc71}.d-neu{color:#7a9aba}
+.vol-fmt{color:#405060;font-size:.72rem}
+
 /* ── Resumen Diario ─────────────────────────────────────────────── */
 .mkt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;padding:16px 18px}
 .mkt-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px}
@@ -1110,6 +1270,7 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   <div class="tab" onclick="setTab('analysts',this)">🎯 Analistas</div>
   <div class="tab" onclick="setTab('technical',this)">📉 Técnico</div>
   <div class="tab" onclick="setTab('market',this)">🌍 Resumen Diario</div>
+  <div class="tab" onclick="setTab('mining',this)">⛏️ Materias Primas</div>
 </div>
 
 <div class="legend">
@@ -1422,7 +1583,9 @@ function setTab(t,el){
   activeTab=t; sortCol=null;
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   el.classList.add('active');
-  if(t==='market') renderMarket(); else renderAll();
+  if(t==='market') renderMarket();
+  else if(t==='mining') renderMining();
+  else renderAll();
 }
 function sortBy(k){
   if(sortCol===k)sortDir*=-1; else{sortCol=k;sortDir=1;}
@@ -1938,6 +2101,132 @@ async function renderMarket(){
   </div>`;
 }
 
+/* ── Materias Primas ── */
+const MINING_BADGE = {
+  'gold':          ['ORO',     'gold'],
+  'silver':        ['PLATA',   'silver'],
+  'copper':        ['COBRE',   'copper'],
+  'uranium':       ['URANIO',  'uranium'],
+  'gold-miner':    ['MINERA ORO',   'miner'],
+  'silver-miner':  ['MINERA PLATA', 'miner'],
+  'copper-miner':  ['MINERA COBRE', 'miner'],
+  'uranium-miner': ['MINERA U',     'miner'],
+  'diversified':   ['DIVERSIF.',    'div'],
+};
+const MINING_GROUPS = [
+  {label:'⚡ Materias Primas — Futuros & ETFs', types:['gold','silver','copper','uranium']},
+  {label:'🥇 Mineras de Oro',                  types:['gold-miner']},
+  {label:'🪨 Mineras de Plata',                types:['silver-miner']},
+  {label:'🔩 Mineras de Cobre & Uranio',       types:['copper-miner','uranium-miner']},
+  {label:'🌏 Mineras Diversificadas',          types:['diversified']},
+];
+
+function mRsi(v){
+  if(v==null) return '<span class="na">—</span>';
+  const cls = v>=70?'rsi-ob':v<=30?'rsi-os':'rsi-mid';
+  return `<span class="${cls}">${v.toFixed(0)}</span>`;
+}
+function mChg(v){
+  if(v==null) return '<span class="na">—</span>';
+  const cls = v>=0?'m-chg-pos':'m-chg-neg';
+  return `<span class="${cls}">${v>=0?'+':''}${v.toFixed(2)}%</span>`;
+}
+function mDist(v, invert=false){
+  if(v==null) return '<span class="na">—</span>';
+  // d30h is always ≤0 (below high); d30l is always ≥0 (above low)
+  const cls = (invert ? v<=0 : v>=0) ? 'd-pos' : 'd-neg';
+  return `<span class="${cls}">${v>=0?'+':''}${v.toFixed(1)}%</span>`;
+}
+function mVol(v){
+  if(!v) return '<span class="na">—</span>';
+  if(v>=1e9) return `<span class="vol-fmt">${(v/1e9).toFixed(1)}B</span>`;
+  if(v>=1e6) return `<span class="vol-fmt">${(v/1e6).toFixed(1)}M</span>`;
+  if(v>=1e3) return `<span class="vol-fmt">${(v/1e3).toFixed(0)}K</span>`;
+  return `<span class="vol-fmt">${v}</span>`;
+}
+function mPrice(v){
+  if(v==null) return '<span class="na">—</span>';
+  // futures can be large (gold ~2300) or tiny (copper ~4.5)
+  const dec = v>=100?2:v>=1?3:5;
+  return `<span class="m-price">${v.toFixed(dec)}</span>`;
+}
+
+async function renderMining(){
+  document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Cargando materias primas y mineras...</div>';
+  let d;
+  try{
+    const j=await(await fetch('/api/mining')).json();
+    d=j.items||[];
+  }catch(e){
+    document.getElementById('root').innerHTML=`<div class="mkt-loading">⚠ Error: ${e.message}</div>`;
+    return;
+  }
+  if(!d.length){
+    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Los datos se están calculando por primera vez (~90s)...</div>';
+    setTimeout(renderMining,10000); return;
+  }
+
+  const byType={};
+  d.forEach(r=>{ (byType[r.type]||(byType[r.type]=[])).push(r); });
+
+  const tableHdr=`<table class="mining-table">
+    <thead><tr>
+      <th>Activo</th>
+      <th class="r">Precio</th>
+      <th class="r">Δ Día</th>
+      <th class="r">Dist. Máx 30d</th>
+      <th class="r">Dist. Mín 30d</th>
+      <th style="min-width:80px">Rango 30d</th>
+      <th class="r">Dist. Máx 52s</th>
+      <th class="r">RSI-14</th>
+      <th class="r">ATR% 14</th>
+      <th class="r">Volumen</th>
+    </tr></thead><tbody>`;
+
+  let html='<div class="mining-wrap">';
+  MINING_GROUPS.forEach(grp=>{
+    const rows=grp.types.flatMap(t=>byType[t]||[]);
+    if(!rows.length) return;
+    html+=`<div class="mining-section">
+      <div class="mining-section-title">${grp.label}</div>
+      ${tableHdr}`;
+    rows.forEach(r=>{
+      const [blbl,bcls]=MINING_BADGE[r.type]||['—','miner'];
+      const pos30pct=r.pos30??50;
+      html+=`<tr>
+        <td>
+          <span class="m-ticker">${r.ticker}</span>
+          <span class="m-badge m-badge-${bcls}">${blbl}</span><br>
+          <span class="m-name">${r.name}</span>
+        </td>
+        <td class="r">${mPrice(r.price)}</td>
+        <td class="r">${mChg(r.chgp)}</td>
+        <td class="r">${mDist(r.d30h,false)}</td>
+        <td class="r">${mDist(r.d30l,true)}</td>
+        <td>
+          <div class="range30-bar" title="Posición en rango 30d: ${pos30pct.toFixed(0)}%">
+            <div class="range30-fill" style="width:${pos30pct}%"></div>
+          </div>
+          <span style="font-size:.65rem;color:#405060;margin-left:4px">${pos30pct.toFixed(0)}%</span>
+        </td>
+        <td class="r">${mDist(r.d52h,false)}</td>
+        <td class="r">${mRsi(r.rsi14)}</td>
+        <td class="r">${r.atr_pct!=null?`<span style="color:#607080">${r.atr_pct.toFixed(2)}%</span>`:'<span class="na">—</span>'}</td>
+        <td class="r">${mVol(r.volume)}</td>
+      </tr>`;
+    });
+    html+='</tbody></table></div>';
+  });
+  html+=`<div style="font-size:.62rem;color:#1e3040;padding:4px 2px">
+    ATR% = ATR-14 como % del precio — mide volatilidad diaria esperada.
+    Rango 30d: posición del precio entre mínimo (0%) y máximo (100%) del mes.
+    Actualizado: ${(await(await fetch('/api/mining')).json()).updated_at||'—'}
+    &nbsp;·&nbsp;<span style="cursor:pointer;color:#2a6aaa" onclick="renderMining()">↻ Refrescar</span>
+  </div>`;
+  html+='</div>';
+  document.getElementById('root').innerHTML=html;
+}
+
 /* ── fetch ── */
 async function refresh(){
   try{
@@ -1955,6 +2244,7 @@ async function refresh(){
 refresh();
 setInterval(refresh,POLL);
 setInterval(()=>{ if(activeTab==='market') renderMarket(); }, 60000);
+setInterval(()=>{ if(activeTab==='mining') renderMining(); }, 120000);
 </script>
 </body>
 </html>"""
@@ -1971,10 +2261,12 @@ if __name__=='__main__':
     threading.Thread(target=load_technicals,   daemon=True).start()
     threading.Thread(target=load_sparklines,   daemon=True).start()
     threading.Thread(target=load_market_data,  daemon=True).start()
+    threading.Thread(target=load_mining_data,  daemon=True).start()
     threading.Thread(target=fundamentals_loop, daemon=True).start()
     threading.Thread(target=technicals_loop,   daemon=True).start()
     threading.Thread(target=sparklines_loop,   daemon=True).start()
     threading.Thread(target=market_loop,       daemon=True).start()
+    threading.Thread(target=mining_loop,       daemon=True).start()
     threading.Thread(target=start_ws,          daemon=True).start()
     # Solo abre el navegador si estamos corriendo localmente
     if not os.environ.get("PORT"):
