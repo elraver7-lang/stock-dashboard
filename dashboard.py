@@ -568,163 +568,326 @@ def mining_loop():
         load_mining_data()
 
 # ── Options helpers ───────────────────────────────────────────────────────────
-OPTIONS_TICKERS = {
-    'SPY':     'SPY — S&P 500 ETF',
-    'BTC-USD': 'Bitcoin (BTC)',
-    'SLV':     'Silver ETF (SLV)',
-    'GGAL':    'Galicia (GGAL)',
-}
+# BTC uses Deribit (yfinance BTC-USD has no options market)
+# SPY, SLV, GGAL use yfinance / CBOE data
+OPTIONS_YF_TICKERS  = {'SPY':'SPY — S&P 500 ETF', 'SLV':'Silver ETF (SLV)', 'GGAL':'Galicia (GGAL)'}
+OPTIONS_ALL_LABELS  = {'SPY':'SPY — S&P 500 ETF', 'BTC':'Bitcoin (BTC) — Deribit',
+                       'SLV':'Silver ETF (SLV)',   'GGAL':'Galicia (GGAL)'}
 
-def _max_pain(calls_df, puts_df):
-    """Vectorized max-pain: strike that minimizes total options writer loss."""
+def _exp_flags(dt):
+    """Is this expiry monthly (3rd Friday) or quarterly (3rd Friday of Mar/Jun/Sep/Dec)?"""
+    is_m = (dt.weekday() == 4 and 14 < dt.day <= 21)
+    is_q = is_m and dt.month in (3, 6, 9, 12)
+    return is_m, is_q
+
+def _max_pain_np(c_k, c_oi, p_k, p_oi):
+    """Vectorized max-pain via numpy."""
     try:
-        c_k  = calls_df['strike'].values if not calls_df.empty else np.array([])
-        c_oi = calls_df['openInterest'].fillna(0).values if not calls_df.empty else np.array([])
-        p_k  = puts_df['strike'].values  if not puts_df.empty else np.array([])
-        p_oi = puts_df['openInterest'].fillna(0).values if not puts_df.empty else np.array([])
-
         strikes = np.unique(np.concatenate([c_k, p_k]))
-        if len(strikes) == 0:
-            return None
-
+        if not len(strikes): return None
         pain = np.zeros(len(strikes))
-        for i, sp in enumerate(strikes):
-            if len(c_k): pain[i] += np.sum(np.maximum(0, sp - c_k) * c_oi)
-            if len(p_k): pain[i] += np.sum(np.maximum(0, p_k - sp) * p_oi)
+        if len(c_k): pain += np.array([np.sum(np.maximum(0, sp - c_k) * c_oi) for sp in strikes])
+        if len(p_k): pain += np.array([np.sum(np.maximum(0, p_k - sp) * p_oi) for sp in strikes])
         return float(round(strikes[np.argmin(pain)], 2))
     except Exception:
         return None
 
-def _gamma_levels(calls_df, puts_df, current_price, n=10):
-    """Return top-n strikes by total OI, with call/put breakdown."""
+def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
+    """
+    Fast vectorized gamma levels with flow signal.
+    Flow score 0-1: near 0 = last trade at bid (VENDIDO/sold), near 1 = last at ask (COMPRADO/bought).
+    """
     try:
-        rec = {}
+        parts = []
         for df, side in [(calls_df, 'c'), (puts_df, 'p')]:
-            if df.empty: continue
-            for _, row in df.iterrows():
-                k   = round(float(row['strike']), 2)
-                oi  = int(row.get('openInterest') or 0)
-                iv  = float(row.get('impliedVolatility') or 0)
-                if k not in rec:
-                    rec[k] = {'strike': k, 'c_oi': 0, 'p_oi': 0, 'c_iv': 0, 'p_iv': 0}
-                rec[k][f'{side}_oi'] += oi
-                if iv: rec[k][f'{side}_iv'] = round(iv * 100, 1)
-
-        items = list(rec.values())
-        for r in items:
-            r['total_oi'] = r['c_oi'] + r['p_oi']
-            r['dominant'] = 'call' if r['c_oi'] >= r['p_oi'] else 'put'
+            if df is None or df.empty: continue
+            cols = set(df.columns)
+            # filter ±22% from current price to reduce SPY's 400+ strikes
             if current_price and current_price > 0:
-                r['dist_pct'] = round(((r['strike'] - current_price) / current_price) * 100, 1)
-            else:
-                r['dist_pct'] = None
-        items.sort(key=lambda x: x['total_oi'], reverse=True)
-        return items[:n]
-    except Exception:
+                df = df[df['strike'].between(current_price * 0.78, current_price * 1.22)]
+            if df.empty: continue
+
+            sub = pd.DataFrame()
+            sub['strike'] = df['strike'].round(2).values
+            sub['oi']     = df['openInterest'].fillna(0).astype(int).values  if 'openInterest'       in cols else 0
+            sub['vol']    = df['volume'].fillna(0).astype(int).values         if 'volume'             in cols else 0
+            sub['iv']     = (df['impliedVolatility'].fillna(0)*100).round(1).values if 'impliedVolatility' in cols else 0.0
+            sub['bid']    = df['bid'].fillna(0).values                         if 'bid'               in cols else 0.0
+            sub['ask']    = df['ask'].fillna(0).values                         if 'ask'               in cols else 0.0
+            sub['last']   = df['lastPrice'].fillna(0).values                   if 'lastPrice'         in cols else 0.0
+            sub['itm']    = df['inTheMoney'].fillna(False).astype(bool).values if 'inTheMoney'        in cols else False
+            sub['side']   = side
+            parts.append(sub)
+
+        if not parts: return []
+        all_d = pd.concat(parts, ignore_index=True)
+
+        # Flow score: (last - bid) / (ask - bid), clipped [0,1]. Only valid when spread > 0
+        spread = all_d['ask'] - all_d['bid']
+        valid  = (spread > 0.001) & (all_d['last'] > 0)
+        all_d['flow'] = np.where(valid, ((all_d['last'] - all_d['bid']) / spread).clip(0, 1), np.nan)
+
+        # Group by (strike, side)
+        g = all_d.groupby(['strike','side']).agg(
+            oi=('oi','sum'), vol=('vol','sum'),
+            iv=('iv','max'),
+            flow=('flow','mean'),  # mean of flow scores across same strike
+            itm=('itm','any'),
+        ).reset_index()
+
+        # Pivot to one row per strike
+        calls_g = g[g['side']=='c'].set_index('strike').add_prefix('c_').drop(columns=['c_side'])
+        puts_g  = g[g['side']=='p'].set_index('strike').add_prefix('p_').drop(columns=['p_side'])
+        merged  = calls_g.join(puts_g, how='outer').fillna({'c_oi':0,'p_oi':0,'c_vol':0,'p_vol':0,'c_iv':0,'p_iv':0})
+        merged['total_oi']  = merged['c_oi'] + merged['p_oi']
+        merged['total_vol'] = merged['c_vol'] + merged['p_vol']
+        merged = merged.nlargest(n, 'total_oi')
+
+        items = []
+        for strike_val, row in merged.iterrows():
+            dist = round(((strike_val - current_price) / current_price)*100, 1) if current_price else None
+            dominant = 'call' if row['c_oi'] >= row['p_oi'] else 'put'
+            if dist is None:              moneyness = '—'
+            elif abs(dist) <= 1.5:        moneyness = 'ATM'
+            elif strike_val > current_price: moneyness = 'OTM' if dominant == 'call' else 'ITM'
+            else:                          moneyness = 'ITM' if dominant == 'call' else 'OTM'
+
+            def safe_flow(v):
+                try: return round(float(v), 2) if not np.isnan(v) else None
+                except: return None
+
+            items.append({
+                'strike':    round(float(strike_val), 2),
+                'c_oi':      int(row['c_oi']),
+                'p_oi':      int(row['p_oi']),
+                'c_vol':     int(row.get('c_vol', 0)),
+                'p_vol':     int(row.get('p_vol', 0)),
+                'c_iv':      round(float(row['c_iv']), 1) if row.get('c_iv') else None,
+                'p_iv':      round(float(row['p_iv']), 1) if row.get('p_iv') else None,
+                'c_flow':    safe_flow(row.get('c_flow', float('nan'))),
+                'p_flow':    safe_flow(row.get('p_flow', float('nan'))),
+                'total_oi':  int(row['total_oi']),
+                'total_vol': int(row['total_vol']),
+                'dominant':  dominant,
+                'dist_pct':  dist,
+                'moneyness': moneyness,
+            })
+        return items
+    except Exception as e:
+        print(f"  ✗ _gamma_levels_df: {e}")
         return []
 
-def _nearest_expiries(sym, n=6):
-    """Return the next n expiry dates and whether they're 'mega' (monthly/quarterly)."""
+def _process_chain_expiry(t, exp, cur_price, exp_info):
+    """Fetch + process a single expiry date from yfinance; returns expiry dict or None."""
     try:
-        exps = yf.Ticker(sym).options
-        out  = []
-        for e in (exps or [])[:n]:
-            dt   = datetime.strptime(e, '%Y-%m-%d')
-            # monthly = 3rd Friday of the month
-            is_monthly = (dt.weekday() == 4 and 14 < dt.day <= 21)
-            is_quarterly = is_monthly and dt.month in (3, 6, 9, 12)
-            out.append({'date': e, 'monthly': is_monthly, 'quarterly': is_quarterly})
-        return out
-    except Exception:
-        return []
+        chain  = t.option_chain(exp)
+        calls, puts = chain.calls, chain.puts
+
+        def safe_col(df, col):
+            return df[col].fillna(0) if col in df.columns else pd.Series(0, index=df.index)
+
+        c_oi   = int(safe_col(calls,'openInterest').sum())
+        p_oi   = int(safe_col(puts, 'openInterest').sum())
+        c_vol  = int(safe_col(calls,'volume').sum())
+        p_vol  = int(safe_col(puts, 'volume').sum())
+        pc_oi  = round(p_oi / c_oi,  2) if c_oi  > 0 else None
+        pc_vol = round(p_vol / c_vol, 2) if c_vol > 0 else None
+
+        c_k  = calls['strike'].values         if not calls.empty else np.array([])
+        c_oi_v = safe_col(calls,'openInterest').values if not calls.empty else np.array([])
+        p_k  = puts['strike'].values          if not puts.empty else np.array([])
+        p_oi_v = safe_col(puts, 'openInterest').values if not puts.empty else np.array([])
+        mp   = _max_pain_np(c_k, c_oi_v, p_k, p_oi_v)
+        mp_dist = round(((mp - cur_price) / cur_price)*100, 1) if mp and cur_price else None
+
+        levels = _gamma_levels_df(calls, puts, cur_price, n=10)
+        dte    = max((datetime.strptime(exp,'%Y-%m-%d') - datetime.now()).days, 0)
+
+        return {
+            'date': exp, 'dte': dte,
+            'monthly': exp_info['monthly'], 'quarterly': exp_info['quarterly'],
+            'c_oi': c_oi, 'p_oi': p_oi, 'c_vol': c_vol, 'p_vol': p_vol,
+            'pc_oi': pc_oi, 'pc_vol': pc_vol,
+            'max_pain': mp, 'mp_dist': mp_dist, 'levels': levels,
+        }
+    except Exception as e:
+        print(f"    ✗ {exp}: {e}")
+        return None
+
+def _load_yf_options(sym, label, n_exp=5):
+    """Load options for a single yfinance-supported ticker."""
+    try:
+        t       = yf.Ticker(sym)
+        all_exp = t.options or []
+        if not all_exp:
+            print(f"    ✗ {sym}: sin vencimientos en yfinance")
+            return None
+
+        cur_price = None
+        try:
+            h = t.history(period='2d', interval='1d')
+            if not h.empty: cur_price = round(float(h['Close'].iloc[-1]), 4)
+        except Exception: pass
+
+        expiries_out, total_c, total_p = [], 0, 0
+        for exp in all_exp[:n_exp]:
+            dt        = datetime.strptime(exp,'%Y-%m-%d')
+            is_m, is_q = _exp_flags(dt)
+            info      = {'date': exp, 'monthly': is_m, 'quarterly': is_q}
+            row       = _process_chain_expiry(t, exp, cur_price, info)
+            if row:
+                expiries_out.append(row)
+                total_c += row['c_oi']
+                total_p += row['p_oi']
+            time.sleep(0.8)
+
+        agg_pc = round(total_p / total_c, 2) if total_c > 0 else None
+        print(f"    ✓ {sym}  {len(expiries_out)} vencimientos  P/C={agg_pc}")
+        return {
+            'label': label, 'price': cur_price,
+            'expiries': expiries_out,
+            'total_call_oi_all': total_c, 'total_put_oi_all': total_p,
+            'agg_pc': agg_pc, 'source': 'yfinance',
+        }
+    except Exception as e:
+        print(f"    ✗ {sym}: {e}")
+        return None
+
+def _load_btc_options_deribit():
+    """Fetch BTC options from Deribit public API (no auth required)."""
+    import re as _re
+    MONTHS = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+              'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
+    try:
+        r = requests.get(
+            'https://www.deribit.com/api/v2/public/get_book_summary_by_currency',
+            params={'currency':'BTC','kind':'option'},
+            headers={'User-Agent':'Mozilla/5.0'}, timeout=20
+        )
+        items = r.json().get('result', [])
+        if not items:
+            print("    ✗ BTC Deribit: sin datos"); return None
+    except Exception as e:
+        print(f"    ✗ BTC Deribit fetch: {e}"); return None
+
+    # Current BTC price from yfinance as fallback
+    cur_price = None
+    try:
+        h = yf.Ticker('BTC-USD').history(period='2d', interval='1d')
+        if not h.empty: cur_price = round(float(h['Close'].iloc[-1]), 0)
+    except Exception: pass
+
+    # Group by expiry
+    from collections import defaultdict
+    by_exp = defaultdict(lambda: {'c':[], 'p':[]})
+    for item in items:
+        name = item.get('instrument_name','')
+        parts = name.split('-')
+        if len(parts) != 4: continue
+        m2 = _re.match(r'(\d+)([A-Z]+)(\d+)', parts[1])
+        if not m2 or m2.group(2) not in MONTHS: continue
+        d, mo, yr = int(m2.group(1)), MONTHS[m2.group(2)], int('20'+m2.group(3)) if len(m2.group(3))==2 else int(m2.group(3))
+        exp_str = f"{yr}-{mo:02d}-{d:02d}"
+        side    = 'c' if parts[3]=='C' else 'p'
+        by_exp[exp_str][side].append({
+            'strike': float(parts[2]),
+            'oi':     float(item.get('open_interest',0)),
+            'vol':    float(item.get('volume',0)),
+            'iv':     float(item.get('mark_iv',0)),
+        })
+
+    expiries_out, total_c, total_p = [], 0, 0
+    for exp in sorted(by_exp.keys())[:6]:
+        calls_list = by_exp[exp]['c']
+        puts_list  = by_exp[exp]['p']
+        c_oi  = int(sum(x['oi'] for x in calls_list))
+        p_oi  = int(sum(x['oi'] for x in puts_list))
+        c_vol = int(sum(x['vol'] for x in calls_list))
+        p_vol = int(sum(x['vol'] for x in puts_list))
+        pc_oi = round(p_oi/c_oi, 2) if c_oi > 0 else None
+
+        # max pain via numpy
+        if calls_list and puts_list:
+            c_k   = np.array([x['strike'] for x in calls_list])
+            c_oiv = np.array([x['oi']     for x in calls_list])
+            p_k   = np.array([x['strike'] for x in puts_list])
+            p_oiv = np.array([x['oi']     for x in puts_list])
+            mp    = _max_pain_np(c_k, c_oiv, p_k, p_oiv)
+        else:
+            mp = None
+        mp_dist = round(((mp - cur_price)/cur_price)*100, 1) if mp and cur_price else None
+
+        # key OI levels (filter ±25% and top 10)
+        all_strikes = {}
+        for x in calls_list:
+            k = x['strike']
+            if cur_price and (k < cur_price*0.75 or k > cur_price*1.25): continue
+            all_strikes.setdefault(k, {'strike':k,'c_oi':0,'p_oi':0,'c_vol':0,'p_vol':0,'c_iv':None,'p_iv':None,'c_flow':None,'p_flow':None,'total_oi':0,'total_vol':0,'dominant':'call','dist_pct':None,'moneyness':'—'})
+            all_strikes[k]['c_oi']  += int(x['oi'])
+            all_strikes[k]['c_vol'] += int(x['vol'])
+            if x['iv']: all_strikes[k]['c_iv'] = round(x['iv'], 1)
+        for x in puts_list:
+            k = x['strike']
+            if cur_price and (k < cur_price*0.75 or k > cur_price*1.25): continue
+            all_strikes.setdefault(k, {'strike':k,'c_oi':0,'p_oi':0,'c_vol':0,'p_vol':0,'c_iv':None,'p_iv':None,'c_flow':None,'p_flow':None,'total_oi':0,'total_vol':0,'dominant':'put','dist_pct':None,'moneyness':'—'})
+            all_strikes[k]['p_oi']  += int(x['oi'])
+            all_strikes[k]['p_vol'] += int(x['vol'])
+            if x['iv']: all_strikes[k]['p_iv'] = round(x['iv'], 1)
+        for v in all_strikes.values():
+            v['total_oi'] = v['c_oi'] + v['p_oi']
+            v['total_vol']= v['c_vol']+ v['p_vol']
+            v['dominant'] = 'call' if v['c_oi'] >= v['p_oi'] else 'put'
+            if cur_price:
+                v['dist_pct'] = round(((v['strike']-cur_price)/cur_price)*100,1)
+                d = abs(v['dist_pct'])
+                if d <= 1.5: v['moneyness']='ATM'
+                elif v['strike']>cur_price: v['moneyness']='OTM' if v['dominant']=='call' else 'ITM'
+                else: v['moneyness']='ITM' if v['dominant']=='call' else 'OTM'
+        levels = sorted(all_strikes.values(), key=lambda x: x['total_oi'], reverse=True)[:10]
+
+        dt = datetime.strptime(exp,'%Y-%m-%d')
+        is_m, is_q = _exp_flags(dt)
+        dte = max((dt - datetime.now()).days, 0)
+        expiries_out.append({
+            'date':exp,'dte':dte,'monthly':is_m,'quarterly':is_q,
+            'c_oi':c_oi,'p_oi':p_oi,'c_vol':c_vol,'p_vol':p_vol,
+            'pc_oi':pc_oi,'pc_vol':None,'max_pain':mp,'mp_dist':mp_dist,'levels':levels,
+        })
+        total_c += c_oi; total_p += p_oi
+
+    if not expiries_out:
+        print("    ✗ BTC Deribit: sin expiries procesados"); return None
+
+    agg_pc = round(total_p/total_c,2) if total_c > 0 else None
+    print(f"    ✓ BTC Deribit  {len(expiries_out)} vencimientos  P/C={agg_pc}  (OI en contratos BTC)")
+    return {
+        'label': 'Bitcoin (BTC) — Deribit', 'price': cur_price,
+        'expiries': expiries_out,
+        'total_call_oi_all': total_c, 'total_put_oi_all': total_p,
+        'agg_pc': agg_pc, 'source': 'deribit', 'oi_unit': 'contratos BTC',
+    }
 
 def load_options_data():
-    """Fetch options chain for SPY, BTC-USD, SLV, GGAL: max pain, OI levels, P/C."""
+    """Fetch options for SPY, BTC (Deribit), SLV, GGAL."""
     print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de opciones...")
     result = {}
 
-    for sym, label in OPTIONS_TICKERS.items():
+    # yfinance tickers
+    for sym, label in OPTIONS_YF_TICKERS.items():
         print(f"  → {sym}")
-        try:
-            t       = yf.Ticker(sym)
-            exps    = t.options
-            if not exps:
-                print(f"    ✗ sin vencimientos disponibles")
-                continue
+        data = _load_yf_options(sym, label, n_exp=5)
+        if data: result[sym] = data
+        time.sleep(1.5)
 
-            # current price
-            cur_price = None
-            try:
-                h = t.history(period='2d', interval='1d')
-                if not h.empty:
-                    cur_price = round(float(h['Close'].iloc[-1]), 4)
-            except Exception:
-                pass
-
-            sym_result = {
-                'label':     label,
-                'price':     cur_price,
-                'expiries':  [],
-                'total_put_oi_all': 0,
-                'total_call_oi_all': 0,
-            }
-
-            for exp_info in _nearest_expiries(sym, n=6):
-                exp = exp_info['date']
-                try:
-                    chain  = t.option_chain(exp)
-                    calls  = chain.calls
-                    puts   = chain.puts
-                    c_oi   = int(calls['openInterest'].fillna(0).sum()) if not calls.empty else 0
-                    p_oi   = int(puts['openInterest'].fillna(0).sum())  if not puts.empty  else 0
-                    c_vol  = int(calls['volume'].fillna(0).sum())       if not calls.empty else 0
-                    p_vol  = int(puts['volume'].fillna(0).sum())        if not puts.empty  else 0
-                    pc_oi  = round(p_oi / c_oi, 2) if c_oi > 0 else None
-                    pc_vol = round(p_vol / c_vol, 2) if c_vol > 0 else None
-                    mp     = _max_pain(calls, puts)
-                    mp_dist= round(((mp - cur_price) / cur_price) * 100, 1) if mp and cur_price else None
-                    levels = _gamma_levels(calls, puts, cur_price, n=8)
-
-                    sym_result['total_call_oi_all'] += c_oi
-                    sym_result['total_put_oi_all']  += p_oi
-
-                    # days to expiry
-                    dte = (datetime.strptime(exp, '%Y-%m-%d') - datetime.now()).days
-
-                    sym_result['expiries'].append({
-                        'date':       exp,
-                        'dte':        max(dte, 0),
-                        'monthly':    exp_info['monthly'],
-                        'quarterly':  exp_info['quarterly'],
-                        'c_oi':       c_oi,
-                        'p_oi':       p_oi,
-                        'c_vol':      c_vol,
-                        'p_vol':      p_vol,
-                        'pc_oi':      pc_oi,
-                        'pc_vol':     pc_vol,
-                        'max_pain':   mp,
-                        'mp_dist':    mp_dist,
-                        'levels':     levels,
-                    })
-                    time.sleep(0.5)
-                except Exception as e:
-                    print(f"    ✗ {exp}: {e}")
-
-            # aggregate P/C ratio
-            agg_c = sym_result['total_call_oi_all']
-            agg_p = sym_result['total_put_oi_all']
-            sym_result['agg_pc'] = round(agg_p / agg_c, 2) if agg_c > 0 else None
-
-            result[sym] = sym_result
-            print(f"    ✓ {sym}  {len(sym_result['expiries'])} vencimientos  P/C={sym_result['agg_pc']}")
-            time.sleep(1.0)
-        except Exception as e:
-            print(f"  ✗ options {sym}: {e}")
+    # BTC via Deribit
+    print(f"  → BTC (Deribit)")
+    btc_data = _load_btc_options_deribit()
+    if btc_data: result['BTC'] = btc_data
 
     with _lock:
         _options['data']       = result
         _options['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
-    print(f"[{time.strftime('%H:%M:%S')}] Opciones listas ✓")
+    print(f"[{time.strftime('%H:%M:%S')}] Opciones listas ✓  ({list(result.keys())})")
 
 def options_loop():
     while True:
@@ -2447,7 +2610,7 @@ function pcChip(v){
 function mpDistStr(d){
   if(d==null) return '<span class="na">—</span>';
   const cls = d>2?'mp-dist-pos':d<-2?'mp-dist-neg':'mp-dist-neu';
-  return `<span class="${cls}">${d>=0?'+':''}${d.toFixed(1)}% del precio</span>`;
+  return `<span class="${cls}">${d>=0?'+':''}${d.toFixed(1)}%</span>`;
 }
 function fmtOI(v){
   if(!v && v!==0) return '<span class="na">—</span>';
@@ -2455,42 +2618,52 @@ function fmtOI(v){
   if(v>=1e3) return (v/1e3).toFixed(0)+'K';
   return v.toString();
 }
-function oiBar(coi,poi){
-  const tot=coi+poi; if(!tot) return '';
-  const cpct=Math.round(coi/tot*100), ppct=100-cpct;
-  return `<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;width:70px;display:inline-flex">
-    <div style="width:${cpct}%;background:#1a5a28"></div>
-    <div style="width:${ppct}%;background:#5a1a18"></div>
-  </div>`;
+
+/* Flow score 0-1: last vs bid/ask midpoint.
+   >0.65 → last near ask → COMPRADO (buyer initiated)
+   <0.35 → last near bid → VENDIDO (seller initiated)
+   null  → sin datos de bid/ask (ej. Deribit) */
+function flowBadge(f, side){
+  // side: 'c' for call, 'p' for put
+  const isCall = side==='c';
+  if(f==null) return '<span style="color:#2a4050;font-size:.62rem">—</span>';
+  if(f >= 0.65){
+    const meaning = isCall ? '🟢 CALL COMPRADA' : '🟢 PUT COMPRADA';
+    const sub     = isCall ? '<span style="color:#90c090;font-size:.58rem"> especulación alcista</span>'
+                           : '<span style="color:#90c090;font-size:.58rem"> cobertura/bajista</span>';
+    return `<span style="color:#2ecc71;font-weight:700;font-size:.66rem">${meaning}</span>${sub}`;
+  }
+  if(f <= 0.35){
+    const meaning = isCall ? '🔴 CALL VENDIDA' : '🔴 PUT VENDIDA';
+    const sub     = isCall ? '<span style="color:#c09090;font-size:.58rem"> renta/covered call</span>'
+                           : '<span style="color:#c09090;font-size:.58rem"> ingreso/bull put</span>';
+    return `<span style="color:#e74c3c;font-weight:700;font-size:.66rem">${meaning}</span>${sub}`;
+  }
+  return `<span style="color:#708090;font-size:.66rem">⚪ MIXTO</span>`;
 }
+function moneybadge(m){
+  if(!m||m==='—') return '';
+  const colors={'ATM':'#f0c040','OTM':'#607080','ITM':'#4090c0'};
+  const bgs   ={'ATM':'#1e1800','OTM':'#0a1018','ITM':'#081420'};
+  const c=colors[m]||'#607080', bg=bgs[m]||'#0a1018';
+  return `<span style="font-size:.58rem;padding:1px 4px;border-radius:3px;background:${bg};color:${c};border:1px solid ${c}30;font-weight:700;margin-left:3px">${m}</span>`;
+}
+
 function insightText(sym, price, expiries){
   if(!expiries||!expiries.length) return '';
   const first=expiries[0];
-  const mp=first.max_pain, mpd=first.mp_dist;
-  const pc=first.pc_oi;
-  const lvls=first.levels||[];
-
-  // find nearest call wall above and put wall below current price
-  const above=lvls.filter(l=>l.dist_pct>0 && l.dominant==='call').sort((a,b)=>a.dist_pct-b.dist_pct);
-  const below=lvls.filter(l=>l.dist_pct<0 && l.dominant==='put').sort((a,b)=>b.dist_pct-a.dist_pct);
-
+  const lvls=(first.levels||[]);
+  const above=lvls.filter(l=>l.dist_pct>0  && l.dominant==='call').sort((a,b)=>a.dist_pct-b.dist_pct);
+  const below=lvls.filter(l=>l.dist_pct<0  && l.dominant==='put' ).sort((a,b)=>b.dist_pct-a.dist_pct);
   let txt='';
-  if(mp!=null){
-    const dir=mpd>1?'por encima':mpd<-1?'por debajo de':'cerca de';
-    txt+=`<b>Max Pain ${first.date}:</b> ${mp.toFixed(2)} — el precio cotiza ${dir} el max pain`;
-    if(mpd!=null) txt+=` (${mpd>=0?'+':''}${mpd.toFixed(1)}%).`;
-    txt+=' Los market makers tienden a defender este nivel antes del vencimiento. ';
+  if(first.max_pain!=null){
+    const dir=first.mp_dist>1?'por encima de':first.mp_dist<-1?'por debajo de':'cerca de';
+    txt+=`<b>Max Pain ${first.date}:</b> ${first.max_pain>=100?first.max_pain.toFixed(0):first.max_pain.toFixed(2)} — precio ${dir} max pain (${first.mp_dist>=0?'+':''}${(first.mp_dist||0).toFixed(1)}%). Los MMs tienden a defender este nivel antes del vencimiento. `;
   }
-  if(above.length){
-    txt+=`<b>Resistencia Gamma:</b> ${above[0].strike} (${(above[0].c_oi/1000).toFixed(0)}K calls OI) — alta concentración de calls actúa como techo ya que los MMs venden cuando el precio sube. `;
-  }
-  if(below.length){
-    txt+=`<b>Soporte Gamma:</b> ${below[0].strike} (${(below[0].p_oi/1000).toFixed(0)}K puts OI) — alta concentración de puts actúa como piso ya que los MMs compran cuando el precio baja. `;
-  }
-  if(pc!=null){
-    txt+=`<b>P/C OI:</b> ${pc.toFixed(2)} — ${pc>1.2?'posicionamiento bajista elevado (más puts que calls), puede indicar miedo o cobertura.':pc<0.7?'posicionamiento alcista (más calls que puts), mercado optimista.':'posicionamiento neutro/mixto.'} `;
-  }
-  return txt ? `<div class="opt-insight">${txt}</div>` : '';
+  if(above.length) txt+=`<b>Resistencia Gamma:</b> ${above[0].strike>=100?above[0].strike.toFixed(0):above[0].strike.toFixed(2)} (${fmtOI(above[0].c_oi)} calls OI) — los MMs venden delta al subir → techo. `;
+  if(below.length) txt+=`<b>Soporte Gamma:</b> ${below[0].strike>=100?below[0].strike.toFixed(0):below[0].strike.toFixed(2)} (${fmtOI(below[0].p_oi)} puts OI) — los MMs compran delta al bajar → piso. `;
+  if(first.pc_oi!=null) txt+=`<b>P/C OI:</b> ${first.pc_oi.toFixed(2)} — ${first.pc_oi>1.2?'más puts que calls: posicionamiento defensivo/bajista.':first.pc_oi<0.7?'más calls que puts: optimismo/especulación alcista.':'posicionamiento mixto/neutro.'} `;
+  return txt?`<div class="opt-insight">${txt}</div>`:'';
 }
 
 async function renderOptions(){
@@ -2501,42 +2674,47 @@ async function renderOptions(){
 
   const data=j.data||{};
   if(!Object.keys(data).length){
-    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Datos de opciones cargando por primera vez (~2min)...</div>';
-    setTimeout(renderOptions,12000); return;
+    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Calculando datos de opciones por primera vez (~3min)…<br><small style="color:#304050">SPY·SLV·GGAL: CBOE via yfinance — BTC: Deribit</small></div>';
+    setTimeout(renderOptions,14000); return;
   }
 
   let html=`<div class="opt-wrap">
   <div style="padding:0 0 8px;font-size:.68rem;color:#1e3040">
     Actualizado: ${j.updated_at||'—'} &nbsp;·&nbsp;
     <span style="cursor:pointer;color:#2a6aaa" onclick="renderOptions()">↻ Refrescar</span>
-    &nbsp;·&nbsp; Datos: yfinance / CBOE
+    &nbsp;·&nbsp; SPY·SLV·GGAL: CBOE · BTC: Deribit
   </div>
 
-  <!-- Explicación rápida -->
-  <div class="opt-insight" style="margin-bottom:14px;font-size:.71rem;color:#507090">
-    <b>Cómo leer esta hoja:</b>
-    <b>Max Pain</b> = strike donde los vendedores de opciones pierden menos → el precio tiende a "pinear" a ese nivel antes del vencimiento.
-    <b>Gamma Wall Call</b> = strike con mayor OI de calls por encima del precio actual → resistencia: los MMs venden acciones al subir para mantenerse delta-neutral.
-    <b>Gamma Wall Put</b> = strike con mayor OI de puts por debajo → soporte: los MMs compran al bajar.
-    <b>P/C OI</b> &lt; 0.7 = bullish · 0.7-1.1 = neutro · &gt; 1.1 = bearish.
-    <b>Vencimientos grandes</b> (🔵 mensual, 🟡 trimestral) tienen mayor OI y mayor poder de "pinning".
+  <div class="opt-insight" style="margin-bottom:12px;font-size:.70rem;color:#507090;line-height:1.6">
+    <b>Guía rápida —</b>
+    <b>Max Pain:</b> strike donde el total de pérdidas de writers es mínimo; el precio tiende a "pinear" ahí antes del vencimiento. &nbsp;
+    <b>Call Wall ▲:</b> strike con máximo OI de calls por encima del precio → resistencia (MMs venden delta al subir). &nbsp;
+    <b>Put Wall ▼:</b> máximo OI de puts debajo del precio → soporte (MMs compran al bajar). &nbsp;
+    <b>Flow:</b> heurístico bid/ask/last — 🟢 <b>COMPRADA</b> = última operación cerca del ask (comprador inicia) · 🔴 <b>VENDIDA</b> = cerca del bid (vendedor inicia). &nbsp;
+    <b>P/C &lt;0.7</b>=alcista · <b>&gt;1.1</b>=bajista. &nbsp; <b>🔵 Mensual · 🟡 Trimestral</b> = vencimientos grandes, mayor poder de pinning.
   </div>
 
   <div class="opt-ticker-grid">`;
 
-  const TICKER_ORDER=['SPY','BTC-USD','SLV','GGAL'];
+  const TICKER_ORDER=['SPY','BTC','SLV','GGAL'];
   TICKER_ORDER.forEach(sym=>{
     const d=data[sym];
-    if(!d){ html+=`<div class="opt-card"><div class="opt-sym">${sym}</div><div class="opt-insight" style="margin-top:8px">Sin datos de opciones disponibles para este activo.</div></div>`; return; }
+    const displaySym = sym==='BTC'?'BTC':sym;
+    if(!d){
+      html+=`<div class="opt-card"><div class="opt-sym">${displaySym}</div>
+        <div class="opt-insight" style="margin-top:8px">
+          ${sym==='BTC'?'Sin datos de Deribit (posible bloqueo de red en Render). Intentar más tarde.':'Sin datos de opciones disponibles.'}
+        </div></div>`;
+      return;
+    }
 
     const price=d.price;
-    const priceStr=price!=null?`<span class="opt-price-big">${price>=100?price.toFixed(2):price.toFixed(4)}</span>`:'';
+    const fmtP = p => p==null?'—': p>=1000?p.toFixed(0): p>=100?p.toFixed(2): p.toFixed(4);
+    const priceStr=price!=null?`<span class="opt-price-big">${fmtP(price)}</span>`:'';
+    const unitNote=d.oi_unit?`<span style="font-size:.60rem;color:#2a4050;margin-left:6px">(OI en ${d.oi_unit})</span>`:'';
 
-    // aggregate P/C
-    const pcHtml=pcChip(d.agg_pc);
-
-    // ── Expiry table ────────────────────────────────────────────────
-    let expTbl=`<div class="opt-section-lbl">Próximos Vencimientos</div>
+    // ── Expiry table ─────────────────────────────────────────────────
+    let expTbl=`<div class="opt-section-lbl">Próximos Vencimientos ${unitNote}</div>
     <table class="opt-table"><thead><tr>
       <th>Fecha</th><th>DTE</th>
       <th class="r">Calls OI</th><th class="r">Puts OI</th>
@@ -2545,17 +2723,19 @@ async function renderOptions(){
     </tr></thead><tbody>`;
     (d.expiries||[]).forEach(ex=>{
       let badge='';
-      if(ex.quarterly) badge='<span class="exp-badge exp-q">🟡 TRIMESTRAL</span>';
-      else if(ex.monthly) badge='<span class="exp-badge exp-m">🔵 MENSUAL</span>';
+      if(ex.quarterly) badge='<span class="exp-badge exp-q">🟡 TRIM</span>';
+      else if(ex.monthly) badge='<span class="exp-badge exp-m">🔵 MES</span>';
       const pcv=ex.pc_oi;
       const pccls=pcv==null?'oi-tot':pcv<0.7?'oi-call':pcv>1.1?'oi-put':'oi-tot';
-      const mpStr=ex.max_pain!=null?`<span class="mp-price">${ex.max_pain>=100?ex.max_pain.toFixed(2):ex.max_pain.toFixed(4)}</span>`:'<span class="na">—</span>';
+      const mpStr=ex.max_pain!=null
+        ?`<span class="mp-price">${fmtP(ex.max_pain)}</span>`
+        :'<span class="na">—</span>';
       expTbl+=`<tr>
         <td><span class="exp-date">${ex.date}</span>${badge}</td>
         <td><span class="exp-dte">${ex.dte}d</span></td>
         <td class="r"><span class="oi-call">${fmtOI(ex.c_oi)}</span></td>
         <td class="r"><span class="oi-put">${fmtOI(ex.p_oi)}</span></td>
-        <td class="r"><span class="${pccls}">${ex.pc_oi!=null?ex.pc_oi.toFixed(2):'—'}</span></td>
+        <td class="r"><span class="${pccls}">${pcv!=null?pcv.toFixed(2):'—'}</span></td>
         <td class="r"><span class="oi-tot">${ex.pc_vol!=null?ex.pc_vol.toFixed(2):'—'}</span></td>
         <td class="r">${mpStr}</td>
         <td class="r">${mpDistStr(ex.mp_dist)}</td>
@@ -2563,54 +2743,72 @@ async function renderOptions(){
     });
     expTbl+='</tbody></table>';
 
-    // ── Key OI levels (first expiry) ────────────────────────────────
-    const firstExp=d.expiries&&d.expiries[0];
+    // ── Key OI levels (first expiry) with flow ────────────────────────
+    const firstExp=(d.expiries||[])[0];
     let levelsHtml='';
-    if(firstExp && firstExp.levels && firstExp.levels.length){
+    if(firstExp && (firstExp.levels||[]).length){
       const maxOI=Math.max(...firstExp.levels.map(l=>l.total_oi),1);
-      levelsHtml=`<div class="opt-section-lbl">Niveles OI Clave — ${firstExp.date} (🟢 Calls · 🔴 Puts)</div>
+      const hasDeribit = (d.source==='deribit');
+      levelsHtml=`<div class="opt-section-lbl">
+        Niveles OI Clave — ${firstExp.date} &nbsp;
+        <span style="font-weight:400;font-size:.60rem;color:#2a5060">
+          ▲ Call Wall = resistencia &nbsp; ▼ Put Wall = soporte
+          ${hasDeribit?'· (Deribit: sin datos de flow bid/ask)':''}
+        </span>
+      </div>
       <table class="opt-table"><thead><tr>
-        <th>Strike</th><th class="r">Dist%</th>
-        <th class="r">Calls OI</th><th class="r">Puts OI</th>
-        <th>Barra OI</th><th class="r">C IV%</th><th class="r">P IV%</th>
+        <th>Strike</th>
+        <th>Tipo</th>
+        <th class="r">Calls OI</th>
+        <th>Flow Calls</th>
+        <th class="r">Puts OI</th>
+        <th>Flow Puts</th>
+        <th>Barra OI</th>
+        <th class="r">Vol hoy</th>
+        <th class="r">C IV%</th>
       </tr></thead><tbody>`;
       firstExp.levels.forEach(lv=>{
         const dcls=lv.dist_pct>0?'d-pos':lv.dist_pct<0?'d-neg':'d-neu';
-        const domLbl=lv.dominant==='call'
-          ? '<span style="color:#2ecc71;font-weight:700">▲ Call Wall</span>'
-          : '<span style="color:#e74c3c;font-weight:700">▼ Put Wall</span>';
+        const wallLbl=lv.dominant==='call'
+          ?'<span style="color:#2ecc71;font-weight:700;font-size:.70rem">▲ Call Wall</span>'
+          :'<span style="color:#e74c3c;font-weight:700;font-size:.70rem">▼ Put Wall</span>';
         const cpct=Math.round(lv.c_oi/(lv.total_oi||1)*100);
+        const barW=Math.round(lv.total_oi/maxOI*80)+14;
         levelsHtml+=`<tr>
-          <td><b style="font-family:monospace">${lv.strike>=100?lv.strike.toFixed(0):lv.strike.toFixed(2)}</b> ${domLbl}</td>
-          <td class="r"><span class="${dcls}">${lv.dist_pct!=null?(lv.dist_pct>=0?'+':'')+lv.dist_pct.toFixed(1)+'%':'—'}</span></td>
+          <td>
+            <b style="font-family:monospace;font-size:.82rem">${lv.strike>=100?lv.strike.toFixed(0):lv.strike.toFixed(2)}</b>
+            ${moneybadge(lv.moneyness)}
+            <span class="${dcls}" style="font-size:.63rem;margin-left:2px">${lv.dist_pct!=null?(lv.dist_pct>=0?'+':'')+lv.dist_pct.toFixed(1)+'%':'—'}</span>
+          </td>
+          <td>${wallLbl}</td>
           <td class="r"><span class="oi-call">${fmtOI(lv.c_oi)}</span></td>
+          <td>${flowBadge(lv.c_flow,'c')}</td>
           <td class="r"><span class="oi-put">${fmtOI(lv.p_oi)}</span></td>
-          <td class="oi-bar-cell">
-            <div style="display:flex;height:8px;border-radius:3px;overflow:hidden;width:${Math.round(lv.total_oi/maxOI*80)+12}px;min-width:14px">
+          <td>${flowBadge(lv.p_flow,'p')}</td>
+          <td>
+            <div style="display:flex;height:7px;border-radius:3px;overflow:hidden;width:${barW}px;min-width:14px">
               <div style="width:${cpct}%;background:#1a5a28"></div>
               <div style="width:${100-cpct}%;background:#5a1a18"></div>
             </div>
           </td>
-          <td class="r"><span style="color:#607080;font-size:.70rem">${lv.c_iv?lv.c_iv.toFixed(0)+'%':'—'}</span></td>
-          <td class="r"><span style="color:#607080;font-size:.70rem">${lv.p_iv?lv.p_iv.toFixed(0)+'%':'—'}</span></td>
+          <td class="r"><span style="color:#405060;font-size:.68rem">${fmtOI(lv.total_vol)}</span></td>
+          <td class="r"><span style="color:#607080;font-size:.68rem">${lv.c_iv?lv.c_iv.toFixed(0)+'%':'—'}</span></td>
         </tr>`;
       });
       levelsHtml+='</tbody></table>';
     }
 
-    const insight=insightText(sym, price, d.expiries||[]);
-
     html+=`<div class="opt-card">
       <div class="opt-card-hdr">
         <div>
-          <div class="opt-sym">${sym}</div>
+          <div class="opt-sym">${displaySym}</div>
           <div class="opt-name">${d.label}</div>
         </div>
-        ${priceStr}${pcHtml}
+        ${priceStr}${pcChip(d.agg_pc)}
       </div>
       ${expTbl}
       ${levelsHtml}
-      ${insight}
+      ${insightText(sym, price, d.expiries||[])}
     </div>`;
   });
 
