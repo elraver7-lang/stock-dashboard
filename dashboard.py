@@ -1451,9 +1451,10 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 
 /* ── Opciones ────────────────────────────────────────────────────── */
 .opt-wrap{padding:10px 18px 28px}
-.opt-ticker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(460px,1fr));gap:16px;margin-bottom:6px}
-.opt-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px}
-.opt-card-hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px;border-bottom:1px solid #0e2030;padding-bottom:8px}
+.opt-ticker-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:6px}
+.opt-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px;min-width:0;overflow:hidden}
+.opt-tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-bottom:10px}
+.opt-card-hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px;border-bottom:1px solid #0e2030;padding-bottom:8px;flex-wrap:wrap}
 .opt-sym{font-size:1.1rem;font-weight:800;color:#90b8d8}
 .opt-name{font-size:.72rem;color:#304050}
 .opt-price-big{font-size:1.1rem;font-weight:700;color:#c8d8e8;font-family:monospace;margin-left:auto}
@@ -1462,9 +1463,9 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .opt-pc-bear{background:#200a0a;color:#e74c3c;border:1px solid #401a1a}
 .opt-pc-neu {background:#101e2e;color:#a0b8c8;border:1px solid #1e3040}
 .opt-section-lbl{font-size:.63rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#2a6aaa;margin:8px 0 4px}
-.opt-table{width:100%;border-collapse:collapse;font-size:.74rem;margin-bottom:10px}
-.opt-table th{color:#304050;font-size:.62rem;font-weight:600;letter-spacing:.4px;text-transform:uppercase;padding:4px 6px;border-bottom:1px solid #0e2030;white-space:nowrap}
-.opt-table th.r{text-align:right}.opt-table td{padding:4px 6px;border-bottom:1px solid #091520;white-space:nowrap;vertical-align:middle}
+.opt-table{width:100%;border-collapse:collapse;font-size:.73rem;margin-bottom:0}
+.opt-table th{color:#304050;font-size:.60rem;font-weight:600;letter-spacing:.3px;text-transform:uppercase;padding:4px 5px;border-bottom:1px solid #0e2030;white-space:nowrap}
+.opt-table th.r{text-align:right}.opt-table td{padding:3px 5px;border-bottom:1px solid #091520;white-space:nowrap;vertical-align:middle}
 .opt-table td.r{text-align:right}
 .opt-table tr:hover td{background:#0d1d2c}
 .exp-date{font-weight:600;color:#a0b8c8}
@@ -2715,16 +2716,15 @@ async function renderOptions(){
 
     // ── Expiry table ─────────────────────────────────────────────────
     let expTbl=`<div class="opt-section-lbl">Próximos Vencimientos ${unitNote}</div>
-    <table class="opt-table"><thead><tr>
-      <th>Fecha</th><th>DTE</th>
+    <div class="opt-tbl-scroll"><table class="opt-table"><thead><tr>
+      <th>Fecha</th><th class="r">DTE</th>
       <th class="r">Calls OI</th><th class="r">Puts OI</th>
-      <th class="r">P/C OI</th><th class="r">P/C Vol</th>
-      <th class="r">Max Pain</th><th class="r">Dist. precio</th>
+      <th class="r">P/C OI</th><th class="r">Max Pain</th><th class="r">Dist.</th>
     </tr></thead><tbody>`;
     (d.expiries||[]).forEach(ex=>{
       let badge='';
-      if(ex.quarterly) badge='<span class="exp-badge exp-q">🟡 TRIM</span>';
-      else if(ex.monthly) badge='<span class="exp-badge exp-m">🔵 MES</span>';
+      if(ex.quarterly) badge='<span class="exp-badge exp-q">🟡</span>';
+      else if(ex.monthly) badge='<span class="exp-badge exp-m">🔵</span>';
       const pcv=ex.pc_oi;
       const pccls=pcv==null?'oi-tot':pcv<0.7?'oi-call':pcv>1.1?'oi-put':'oi-tot';
       const mpStr=ex.max_pain!=null
@@ -2732,70 +2732,68 @@ async function renderOptions(){
         :'<span class="na">—</span>';
       expTbl+=`<tr>
         <td><span class="exp-date">${ex.date}</span>${badge}</td>
-        <td><span class="exp-dte">${ex.dte}d</span></td>
+        <td class="r"><span class="exp-dte">${ex.dte}d</span></td>
         <td class="r"><span class="oi-call">${fmtOI(ex.c_oi)}</span></td>
         <td class="r"><span class="oi-put">${fmtOI(ex.p_oi)}</span></td>
         <td class="r"><span class="${pccls}">${pcv!=null?pcv.toFixed(2):'—'}</span></td>
-        <td class="r"><span class="oi-tot">${ex.pc_vol!=null?ex.pc_vol.toFixed(2):'—'}</span></td>
         <td class="r">${mpStr}</td>
         <td class="r">${mpDistStr(ex.mp_dist)}</td>
       </tr>`;
     });
-    expTbl+='</tbody></table>';
+    expTbl+='</tbody></table></div>';
 
-    // ── Key OI levels (first expiry) with flow ────────────────────────
+    // ── Key OI levels (first expiry) — OI + flow combined per cell ─────
     const firstExp=(d.expiries||[])[0];
     let levelsHtml='';
     if(firstExp && (firstExp.levels||[]).length){
       const maxOI=Math.max(...firstExp.levels.map(l=>l.total_oi),1);
-      const hasDeribit = (d.source==='deribit');
+      const hasDeribit=(d.source==='deribit');
       levelsHtml=`<div class="opt-section-lbl">
-        Niveles OI Clave — ${firstExp.date} &nbsp;
-        <span style="font-weight:400;font-size:.60rem;color:#2a5060">
-          ▲ Call Wall = resistencia &nbsp; ▼ Put Wall = soporte
-          ${hasDeribit?'· (Deribit: sin datos de flow bid/ask)':''}
+        Niveles OI — ${firstExp.date}
+        <span style="font-weight:400;font-size:.58rem;color:#2a5060">
+          &nbsp;▲ resistencia · ▼ soporte${hasDeribit?' · (sin flow: Deribit)':''}
         </span>
       </div>
-      <table class="opt-table"><thead><tr>
+      <div class="opt-tbl-scroll"><table class="opt-table"><thead><tr>
         <th>Strike</th>
         <th>Tipo</th>
-        <th class="r">Calls OI</th>
-        <th>Flow Calls</th>
-        <th class="r">Puts OI</th>
-        <th>Flow Puts</th>
-        <th>Barra OI</th>
-        <th class="r">Vol hoy</th>
-        <th class="r">C IV%</th>
+        <th class="r">Calls OI · Flow</th>
+        <th class="r">Puts OI · Flow</th>
+        <th>Ratio</th>
+        <th class="r">Vol · IV</th>
       </tr></thead><tbody>`;
       firstExp.levels.forEach(lv=>{
-        const dcls=lv.dist_pct>0?'d-pos':lv.dist_pct<0?'d-neg':'d-neu';
-        const wallLbl=lv.dominant==='call'
-          ?'<span style="color:#2ecc71;font-weight:700;font-size:.70rem">▲ Call Wall</span>'
-          :'<span style="color:#e74c3c;font-weight:700;font-size:.70rem">▼ Put Wall</span>';
-        const cpct=Math.round(lv.c_oi/(lv.total_oi||1)*100);
-        const barW=Math.round(lv.total_oi/maxOI*80)+14;
+        const dcls  = lv.dist_pct>0?'d-pos':lv.dist_pct<0?'d-neg':'d-neu';
+        const wallLbl = lv.dominant==='call'
+          ?'<span style="color:#2ecc71;font-weight:700">▲ Call</span>'
+          :'<span style="color:#e74c3c;font-weight:700">▼ Put</span>';
+        const cpct  = Math.round(lv.c_oi/(lv.total_oi||1)*100);
+        const barW  = Math.round(lv.total_oi/maxOI*70)+12;
+        // OI + flow in one cell, 2 lines
+        const callCell=`<span class="oi-call">${fmtOI(lv.c_oi)}</span><br><span style="font-size:.60rem">${flowBadge(lv.c_flow,'c')}</span>`;
+        const putCell =`<span class="oi-put">${fmtOI(lv.p_oi)}</span><br><span style="font-size:.60rem">${flowBadge(lv.p_flow,'p')}</span>`;
         levelsHtml+=`<tr>
-          <td>
-            <b style="font-family:monospace;font-size:.82rem">${lv.strike>=100?lv.strike.toFixed(0):lv.strike.toFixed(2)}</b>
+          <td style="white-space:nowrap">
+            <b style="font-family:monospace">${lv.strike>=100?lv.strike.toFixed(0):lv.strike.toFixed(2)}</b>
             ${moneybadge(lv.moneyness)}
-            <span class="${dcls}" style="font-size:.63rem;margin-left:2px">${lv.dist_pct!=null?(lv.dist_pct>=0?'+':'')+lv.dist_pct.toFixed(1)+'%':'—'}</span>
+            <br><span class="${dcls}" style="font-size:.60rem">${lv.dist_pct!=null?(lv.dist_pct>=0?'+':'')+lv.dist_pct.toFixed(1)+'%':'—'}</span>
           </td>
           <td>${wallLbl}</td>
-          <td class="r"><span class="oi-call">${fmtOI(lv.c_oi)}</span></td>
-          <td>${flowBadge(lv.c_flow,'c')}</td>
-          <td class="r"><span class="oi-put">${fmtOI(lv.p_oi)}</span></td>
-          <td>${flowBadge(lv.p_flow,'p')}</td>
+          <td class="r" style="line-height:1.4">${callCell}</td>
+          <td class="r" style="line-height:1.4">${putCell}</td>
           <td>
-            <div style="display:flex;height:7px;border-radius:3px;overflow:hidden;width:${barW}px;min-width:14px">
+            <div style="display:flex;height:6px;border-radius:3px;overflow:hidden;width:${barW}px;min-width:12px">
               <div style="width:${cpct}%;background:#1a5a28"></div>
               <div style="width:${100-cpct}%;background:#5a1a18"></div>
             </div>
           </td>
-          <td class="r"><span style="color:#405060;font-size:.68rem">${fmtOI(lv.total_vol)}</span></td>
-          <td class="r"><span style="color:#607080;font-size:.68rem">${lv.c_iv?lv.c_iv.toFixed(0)+'%':'—'}</span></td>
+          <td class="r" style="font-size:.66rem">
+            <span style="color:#405060">${fmtOI(lv.total_vol)}</span>
+            <span style="color:#2a4050;margin-left:3px">${lv.c_iv?lv.c_iv.toFixed(0)+'%':'—'}</span>
+          </td>
         </tr>`;
       });
-      levelsHtml+='</tbody></table>';
+      levelsHtml+='</tbody></table></div>';
     }
 
     html+=`<div class="opt-card">
