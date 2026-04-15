@@ -8,6 +8,7 @@ from flask import Flask, jsonify, render_template_string
 from datetime import datetime, timedelta, timezone
 import finnhub, websocket, yfinance as yf
 import pandas as pd
+import numpy as np
 import requests
 
 API_KEY        = os.environ.get("FINNHUB_API_KEY", "d764qhpr01qm4b7sv75gd764qhpr01qm4b7sv760")
@@ -61,6 +62,7 @@ _tech       = {}
 _sparklines = {}   # ticker -> [price, price, ...]
 _market     = {}   # market summary data
 _mining     = {}   # mining/commodities data
+_options    = {}   # options flow data
 _lock       = threading.Lock()
 fc = finnhub.Client(api_key=API_KEY)
 
@@ -565,6 +567,170 @@ def mining_loop():
         time.sleep(600)   # refresh cada 10 min
         load_mining_data()
 
+# ── Options helpers ───────────────────────────────────────────────────────────
+OPTIONS_TICKERS = {
+    'SPY':     'SPY — S&P 500 ETF',
+    'BTC-USD': 'Bitcoin (BTC)',
+    'SLV':     'Silver ETF (SLV)',
+    'GGAL':    'Galicia (GGAL)',
+}
+
+def _max_pain(calls_df, puts_df):
+    """Vectorized max-pain: strike that minimizes total options writer loss."""
+    try:
+        c_k  = calls_df['strike'].values if not calls_df.empty else np.array([])
+        c_oi = calls_df['openInterest'].fillna(0).values if not calls_df.empty else np.array([])
+        p_k  = puts_df['strike'].values  if not puts_df.empty else np.array([])
+        p_oi = puts_df['openInterest'].fillna(0).values if not puts_df.empty else np.array([])
+
+        strikes = np.unique(np.concatenate([c_k, p_k]))
+        if len(strikes) == 0:
+            return None
+
+        pain = np.zeros(len(strikes))
+        for i, sp in enumerate(strikes):
+            if len(c_k): pain[i] += np.sum(np.maximum(0, sp - c_k) * c_oi)
+            if len(p_k): pain[i] += np.sum(np.maximum(0, p_k - sp) * p_oi)
+        return float(round(strikes[np.argmin(pain)], 2))
+    except Exception:
+        return None
+
+def _gamma_levels(calls_df, puts_df, current_price, n=10):
+    """Return top-n strikes by total OI, with call/put breakdown."""
+    try:
+        rec = {}
+        for df, side in [(calls_df, 'c'), (puts_df, 'p')]:
+            if df.empty: continue
+            for _, row in df.iterrows():
+                k   = round(float(row['strike']), 2)
+                oi  = int(row.get('openInterest') or 0)
+                iv  = float(row.get('impliedVolatility') or 0)
+                if k not in rec:
+                    rec[k] = {'strike': k, 'c_oi': 0, 'p_oi': 0, 'c_iv': 0, 'p_iv': 0}
+                rec[k][f'{side}_oi'] += oi
+                if iv: rec[k][f'{side}_iv'] = round(iv * 100, 1)
+
+        items = list(rec.values())
+        for r in items:
+            r['total_oi'] = r['c_oi'] + r['p_oi']
+            r['dominant'] = 'call' if r['c_oi'] >= r['p_oi'] else 'put'
+            if current_price and current_price > 0:
+                r['dist_pct'] = round(((r['strike'] - current_price) / current_price) * 100, 1)
+            else:
+                r['dist_pct'] = None
+        items.sort(key=lambda x: x['total_oi'], reverse=True)
+        return items[:n]
+    except Exception:
+        return []
+
+def _nearest_expiries(sym, n=6):
+    """Return the next n expiry dates and whether they're 'mega' (monthly/quarterly)."""
+    try:
+        exps = yf.Ticker(sym).options
+        out  = []
+        for e in (exps or [])[:n]:
+            dt   = datetime.strptime(e, '%Y-%m-%d')
+            # monthly = 3rd Friday of the month
+            is_monthly = (dt.weekday() == 4 and 14 < dt.day <= 21)
+            is_quarterly = is_monthly and dt.month in (3, 6, 9, 12)
+            out.append({'date': e, 'monthly': is_monthly, 'quarterly': is_quarterly})
+        return out
+    except Exception:
+        return []
+
+def load_options_data():
+    """Fetch options chain for SPY, BTC-USD, SLV, GGAL: max pain, OI levels, P/C."""
+    print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de opciones...")
+    result = {}
+
+    for sym, label in OPTIONS_TICKERS.items():
+        print(f"  → {sym}")
+        try:
+            t       = yf.Ticker(sym)
+            exps    = t.options
+            if not exps:
+                print(f"    ✗ sin vencimientos disponibles")
+                continue
+
+            # current price
+            cur_price = None
+            try:
+                h = t.history(period='2d', interval='1d')
+                if not h.empty:
+                    cur_price = round(float(h['Close'].iloc[-1]), 4)
+            except Exception:
+                pass
+
+            sym_result = {
+                'label':     label,
+                'price':     cur_price,
+                'expiries':  [],
+                'total_put_oi_all': 0,
+                'total_call_oi_all': 0,
+            }
+
+            for exp_info in _nearest_expiries(sym, n=6):
+                exp = exp_info['date']
+                try:
+                    chain  = t.option_chain(exp)
+                    calls  = chain.calls
+                    puts   = chain.puts
+                    c_oi   = int(calls['openInterest'].fillna(0).sum()) if not calls.empty else 0
+                    p_oi   = int(puts['openInterest'].fillna(0).sum())  if not puts.empty  else 0
+                    c_vol  = int(calls['volume'].fillna(0).sum())       if not calls.empty else 0
+                    p_vol  = int(puts['volume'].fillna(0).sum())        if not puts.empty  else 0
+                    pc_oi  = round(p_oi / c_oi, 2) if c_oi > 0 else None
+                    pc_vol = round(p_vol / c_vol, 2) if c_vol > 0 else None
+                    mp     = _max_pain(calls, puts)
+                    mp_dist= round(((mp - cur_price) / cur_price) * 100, 1) if mp and cur_price else None
+                    levels = _gamma_levels(calls, puts, cur_price, n=8)
+
+                    sym_result['total_call_oi_all'] += c_oi
+                    sym_result['total_put_oi_all']  += p_oi
+
+                    # days to expiry
+                    dte = (datetime.strptime(exp, '%Y-%m-%d') - datetime.now()).days
+
+                    sym_result['expiries'].append({
+                        'date':       exp,
+                        'dte':        max(dte, 0),
+                        'monthly':    exp_info['monthly'],
+                        'quarterly':  exp_info['quarterly'],
+                        'c_oi':       c_oi,
+                        'p_oi':       p_oi,
+                        'c_vol':      c_vol,
+                        'p_vol':      p_vol,
+                        'pc_oi':      pc_oi,
+                        'pc_vol':     pc_vol,
+                        'max_pain':   mp,
+                        'mp_dist':    mp_dist,
+                        'levels':     levels,
+                    })
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"    ✗ {exp}: {e}")
+
+            # aggregate P/C ratio
+            agg_c = sym_result['total_call_oi_all']
+            agg_p = sym_result['total_put_oi_all']
+            sym_result['agg_pc'] = round(agg_p / agg_c, 2) if agg_c > 0 else None
+
+            result[sym] = sym_result
+            print(f"    ✓ {sym}  {len(sym_result['expiries'])} vencimientos  P/C={sym_result['agg_pc']}")
+            time.sleep(1.0)
+        except Exception as e:
+            print(f"  ✗ options {sym}: {e}")
+
+    with _lock:
+        _options['data']       = result
+        _options['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
+    print(f"[{time.strftime('%H:%M:%S')}] Opciones listas ✓")
+
+def options_loop():
+    while True:
+        time.sleep(900)   # refresh cada 15 min
+        load_options_data()
+
 # ── technical helpers ─────────────────────────────────────────────────────────
 def _rsi(series, period=14):
     delta = series.diff()
@@ -910,6 +1076,11 @@ def api_mining():
     with _lock:
         return jsonify(dict(_mining))
 
+@app.route('/api/options')
+def api_options():
+    with _lock:
+        return jsonify(dict(_options))
+
 @app.route('/api/news/<ticker>')
 def api_news(ticker):
     if ticker not in ALL_TICKERS:
@@ -1115,6 +1286,43 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .sig-sell   {background:#280a0a;color:#e74c3c;border:1px solid #581a1a;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 .sig-neutral{background:#101e2e;color:#7a9aba;border:1px solid #1e3040;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 
+/* ── Opciones ────────────────────────────────────────────────────── */
+.opt-wrap{padding:10px 18px 28px}
+.opt-ticker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(460px,1fr));gap:16px;margin-bottom:6px}
+.opt-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px}
+.opt-card-hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px;border-bottom:1px solid #0e2030;padding-bottom:8px}
+.opt-sym{font-size:1.1rem;font-weight:800;color:#90b8d8}
+.opt-name{font-size:.72rem;color:#304050}
+.opt-price-big{font-size:1.1rem;font-weight:700;color:#c8d8e8;font-family:monospace;margin-left:auto}
+.opt-pc-chip{font-size:.72rem;font-weight:700;padding:2px 8px;border-radius:4px;margin-left:6px}
+.opt-pc-bull{background:#0a2010;color:#2ecc71;border:1px solid #1a4020}
+.opt-pc-bear{background:#200a0a;color:#e74c3c;border:1px solid #401a1a}
+.opt-pc-neu {background:#101e2e;color:#a0b8c8;border:1px solid #1e3040}
+.opt-section-lbl{font-size:.63rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#2a6aaa;margin:8px 0 4px}
+.opt-table{width:100%;border-collapse:collapse;font-size:.74rem;margin-bottom:10px}
+.opt-table th{color:#304050;font-size:.62rem;font-weight:600;letter-spacing:.4px;text-transform:uppercase;padding:4px 6px;border-bottom:1px solid #0e2030;white-space:nowrap}
+.opt-table th.r{text-align:right}.opt-table td{padding:4px 6px;border-bottom:1px solid #091520;white-space:nowrap;vertical-align:middle}
+.opt-table td.r{text-align:right}
+.opt-table tr:hover td{background:#0d1d2c}
+.exp-date{font-weight:600;color:#a0b8c8}
+.exp-badge{font-size:.58rem;padding:1px 5px;border-radius:3px;font-weight:700;margin-left:3px;vertical-align:middle}
+.exp-q{background:#1a1005;color:#f0a020;border:1px solid #2a2010}
+.exp-m{background:#0a1020;color:#6090c0;border:1px solid #162030}
+.exp-dte{color:#405060;font-size:.68rem}
+.oi-call{color:#2ecc71}.oi-put{color:#e74c3c}.oi-tot{color:#90a8b8;font-size:.68rem}
+.mp-price{font-weight:700;color:#f0c040;font-family:monospace}
+.mp-dist-neg{color:#e74c3c;font-size:.70rem}.mp-dist-pos{color:#2ecc71;font-size:.70rem}.mp-dist-neu{color:#607080;font-size:.70rem}
+.gamma-bar-wrap{width:100%;height:28px;background:#050f18;border-radius:4px;position:relative;overflow:hidden;margin:4px 0}
+.gamma-call-seg,.gamma-put-seg{position:absolute;top:0;height:100%;opacity:.85}
+.gamma-call-seg{background:#1a4a20;left:50%}
+.gamma-put-seg {background:#4a1010;right:50%}
+.gamma-lbl{position:absolute;top:50%;transform:translateY(-50%);font-size:.60rem;pointer-events:none;padding:0 4px;white-space:nowrap}
+.gamma-center-line{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#1e3a50;z-index:2}
+.opt-insight{background:#060f18;border:1px solid #0e2030;border-radius:6px;padding:8px 10px;font-size:.70rem;color:#4a7090;line-height:1.5;margin-top:6px}
+.opt-insight b{color:#608090}
+.oi-bar-cell{min-width:80px}
+.oi-mini{display:inline-block;height:8px;border-radius:2px;vertical-align:middle;margin-right:3px}
+
 /* ── Materias Primas ─────────────────────────────────────────────── */
 .mining-wrap{padding:10px 18px 24px}
 .mining-section{margin-bottom:18px}
@@ -1271,6 +1479,7 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   <div class="tab" onclick="setTab('technical',this)">📉 Técnico</div>
   <div class="tab" onclick="setTab('market',this)">🌍 Resumen Diario</div>
   <div class="tab" onclick="setTab('mining',this)">⛏️ Materias Primas</div>
+  <div class="tab" onclick="setTab('options',this)">📋 Opciones</div>
 </div>
 
 <div class="legend">
@@ -1585,6 +1794,7 @@ function setTab(t,el){
   el.classList.add('active');
   if(t==='market') renderMarket();
   else if(t==='mining') renderMining();
+  else if(t==='options') renderOptions();
   else renderAll();
 }
 function sortBy(k){
@@ -2227,6 +2437,187 @@ async function renderMining(){
   document.getElementById('root').innerHTML=html;
 }
 
+/* ── Opciones ── */
+function pcChip(v){
+  if(v==null) return '';
+  const cls = v<0.7?'opt-pc-bull':v>1.1?'opt-pc-bear':'opt-pc-neu';
+  const lbl = v<0.7?'↑ Alcista':v>1.1?'↓ Bajista':'↔ Neutro';
+  return `<span class="opt-pc-chip ${cls}">P/C ${v.toFixed(2)} ${lbl}</span>`;
+}
+function mpDistStr(d){
+  if(d==null) return '<span class="na">—</span>';
+  const cls = d>2?'mp-dist-pos':d<-2?'mp-dist-neg':'mp-dist-neu';
+  return `<span class="${cls}">${d>=0?'+':''}${d.toFixed(1)}% del precio</span>`;
+}
+function fmtOI(v){
+  if(!v && v!==0) return '<span class="na">—</span>';
+  if(v>=1e6) return (v/1e6).toFixed(1)+'M';
+  if(v>=1e3) return (v/1e3).toFixed(0)+'K';
+  return v.toString();
+}
+function oiBar(coi,poi){
+  const tot=coi+poi; if(!tot) return '';
+  const cpct=Math.round(coi/tot*100), ppct=100-cpct;
+  return `<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;width:70px;display:inline-flex">
+    <div style="width:${cpct}%;background:#1a5a28"></div>
+    <div style="width:${ppct}%;background:#5a1a18"></div>
+  </div>`;
+}
+function insightText(sym, price, expiries){
+  if(!expiries||!expiries.length) return '';
+  const first=expiries[0];
+  const mp=first.max_pain, mpd=first.mp_dist;
+  const pc=first.pc_oi;
+  const lvls=first.levels||[];
+
+  // find nearest call wall above and put wall below current price
+  const above=lvls.filter(l=>l.dist_pct>0 && l.dominant==='call').sort((a,b)=>a.dist_pct-b.dist_pct);
+  const below=lvls.filter(l=>l.dist_pct<0 && l.dominant==='put').sort((a,b)=>b.dist_pct-a.dist_pct);
+
+  let txt='';
+  if(mp!=null){
+    const dir=mpd>1?'por encima':mpd<-1?'por debajo de':'cerca de';
+    txt+=`<b>Max Pain ${first.date}:</b> ${mp.toFixed(2)} — el precio cotiza ${dir} el max pain`;
+    if(mpd!=null) txt+=` (${mpd>=0?'+':''}${mpd.toFixed(1)}%).`;
+    txt+=' Los market makers tienden a defender este nivel antes del vencimiento. ';
+  }
+  if(above.length){
+    txt+=`<b>Resistencia Gamma:</b> ${above[0].strike} (${(above[0].c_oi/1000).toFixed(0)}K calls OI) — alta concentración de calls actúa como techo ya que los MMs venden cuando el precio sube. `;
+  }
+  if(below.length){
+    txt+=`<b>Soporte Gamma:</b> ${below[0].strike} (${(below[0].p_oi/1000).toFixed(0)}K puts OI) — alta concentración de puts actúa como piso ya que los MMs compran cuando el precio baja. `;
+  }
+  if(pc!=null){
+    txt+=`<b>P/C OI:</b> ${pc.toFixed(2)} — ${pc>1.2?'posicionamiento bajista elevado (más puts que calls), puede indicar miedo o cobertura.':pc<0.7?'posicionamiento alcista (más calls que puts), mercado optimista.':'posicionamiento neutro/mixto.'} `;
+  }
+  return txt ? `<div class="opt-insight">${txt}</div>` : '';
+}
+
+async function renderOptions(){
+  document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Cargando cadena de opciones...</div>';
+  let j;
+  try{ j=await(await fetch('/api/options')).json(); }
+  catch(e){ document.getElementById('root').innerHTML=`<div class="mkt-loading">⚠ Error: ${e.message}</div>`; return; }
+
+  const data=j.data||{};
+  if(!Object.keys(data).length){
+    document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Datos de opciones cargando por primera vez (~2min)...</div>';
+    setTimeout(renderOptions,12000); return;
+  }
+
+  let html=`<div class="opt-wrap">
+  <div style="padding:0 0 8px;font-size:.68rem;color:#1e3040">
+    Actualizado: ${j.updated_at||'—'} &nbsp;·&nbsp;
+    <span style="cursor:pointer;color:#2a6aaa" onclick="renderOptions()">↻ Refrescar</span>
+    &nbsp;·&nbsp; Datos: yfinance / CBOE
+  </div>
+
+  <!-- Explicación rápida -->
+  <div class="opt-insight" style="margin-bottom:14px;font-size:.71rem;color:#507090">
+    <b>Cómo leer esta hoja:</b>
+    <b>Max Pain</b> = strike donde los vendedores de opciones pierden menos → el precio tiende a "pinear" a ese nivel antes del vencimiento.
+    <b>Gamma Wall Call</b> = strike con mayor OI de calls por encima del precio actual → resistencia: los MMs venden acciones al subir para mantenerse delta-neutral.
+    <b>Gamma Wall Put</b> = strike con mayor OI de puts por debajo → soporte: los MMs compran al bajar.
+    <b>P/C OI</b> &lt; 0.7 = bullish · 0.7-1.1 = neutro · &gt; 1.1 = bearish.
+    <b>Vencimientos grandes</b> (🔵 mensual, 🟡 trimestral) tienen mayor OI y mayor poder de "pinning".
+  </div>
+
+  <div class="opt-ticker-grid">`;
+
+  const TICKER_ORDER=['SPY','BTC-USD','SLV','GGAL'];
+  TICKER_ORDER.forEach(sym=>{
+    const d=data[sym];
+    if(!d){ html+=`<div class="opt-card"><div class="opt-sym">${sym}</div><div class="opt-insight" style="margin-top:8px">Sin datos de opciones disponibles para este activo.</div></div>`; return; }
+
+    const price=d.price;
+    const priceStr=price!=null?`<span class="opt-price-big">${price>=100?price.toFixed(2):price.toFixed(4)}</span>`:'';
+
+    // aggregate P/C
+    const pcHtml=pcChip(d.agg_pc);
+
+    // ── Expiry table ────────────────────────────────────────────────
+    let expTbl=`<div class="opt-section-lbl">Próximos Vencimientos</div>
+    <table class="opt-table"><thead><tr>
+      <th>Fecha</th><th>DTE</th>
+      <th class="r">Calls OI</th><th class="r">Puts OI</th>
+      <th class="r">P/C OI</th><th class="r">P/C Vol</th>
+      <th class="r">Max Pain</th><th class="r">Dist. precio</th>
+    </tr></thead><tbody>`;
+    (d.expiries||[]).forEach(ex=>{
+      let badge='';
+      if(ex.quarterly) badge='<span class="exp-badge exp-q">🟡 TRIMESTRAL</span>';
+      else if(ex.monthly) badge='<span class="exp-badge exp-m">🔵 MENSUAL</span>';
+      const pcv=ex.pc_oi;
+      const pccls=pcv==null?'oi-tot':pcv<0.7?'oi-call':pcv>1.1?'oi-put':'oi-tot';
+      const mpStr=ex.max_pain!=null?`<span class="mp-price">${ex.max_pain>=100?ex.max_pain.toFixed(2):ex.max_pain.toFixed(4)}</span>`:'<span class="na">—</span>';
+      expTbl+=`<tr>
+        <td><span class="exp-date">${ex.date}</span>${badge}</td>
+        <td><span class="exp-dte">${ex.dte}d</span></td>
+        <td class="r"><span class="oi-call">${fmtOI(ex.c_oi)}</span></td>
+        <td class="r"><span class="oi-put">${fmtOI(ex.p_oi)}</span></td>
+        <td class="r"><span class="${pccls}">${ex.pc_oi!=null?ex.pc_oi.toFixed(2):'—'}</span></td>
+        <td class="r"><span class="oi-tot">${ex.pc_vol!=null?ex.pc_vol.toFixed(2):'—'}</span></td>
+        <td class="r">${mpStr}</td>
+        <td class="r">${mpDistStr(ex.mp_dist)}</td>
+      </tr>`;
+    });
+    expTbl+='</tbody></table>';
+
+    // ── Key OI levels (first expiry) ────────────────────────────────
+    const firstExp=d.expiries&&d.expiries[0];
+    let levelsHtml='';
+    if(firstExp && firstExp.levels && firstExp.levels.length){
+      const maxOI=Math.max(...firstExp.levels.map(l=>l.total_oi),1);
+      levelsHtml=`<div class="opt-section-lbl">Niveles OI Clave — ${firstExp.date} (🟢 Calls · 🔴 Puts)</div>
+      <table class="opt-table"><thead><tr>
+        <th>Strike</th><th class="r">Dist%</th>
+        <th class="r">Calls OI</th><th class="r">Puts OI</th>
+        <th>Barra OI</th><th class="r">C IV%</th><th class="r">P IV%</th>
+      </tr></thead><tbody>`;
+      firstExp.levels.forEach(lv=>{
+        const dcls=lv.dist_pct>0?'d-pos':lv.dist_pct<0?'d-neg':'d-neu';
+        const domLbl=lv.dominant==='call'
+          ? '<span style="color:#2ecc71;font-weight:700">▲ Call Wall</span>'
+          : '<span style="color:#e74c3c;font-weight:700">▼ Put Wall</span>';
+        const cpct=Math.round(lv.c_oi/(lv.total_oi||1)*100);
+        levelsHtml+=`<tr>
+          <td><b style="font-family:monospace">${lv.strike>=100?lv.strike.toFixed(0):lv.strike.toFixed(2)}</b> ${domLbl}</td>
+          <td class="r"><span class="${dcls}">${lv.dist_pct!=null?(lv.dist_pct>=0?'+':'')+lv.dist_pct.toFixed(1)+'%':'—'}</span></td>
+          <td class="r"><span class="oi-call">${fmtOI(lv.c_oi)}</span></td>
+          <td class="r"><span class="oi-put">${fmtOI(lv.p_oi)}</span></td>
+          <td class="oi-bar-cell">
+            <div style="display:flex;height:8px;border-radius:3px;overflow:hidden;width:${Math.round(lv.total_oi/maxOI*80)+12}px;min-width:14px">
+              <div style="width:${cpct}%;background:#1a5a28"></div>
+              <div style="width:${100-cpct}%;background:#5a1a18"></div>
+            </div>
+          </td>
+          <td class="r"><span style="color:#607080;font-size:.70rem">${lv.c_iv?lv.c_iv.toFixed(0)+'%':'—'}</span></td>
+          <td class="r"><span style="color:#607080;font-size:.70rem">${lv.p_iv?lv.p_iv.toFixed(0)+'%':'—'}</span></td>
+        </tr>`;
+      });
+      levelsHtml+='</tbody></table>';
+    }
+
+    const insight=insightText(sym, price, d.expiries||[]);
+
+    html+=`<div class="opt-card">
+      <div class="opt-card-hdr">
+        <div>
+          <div class="opt-sym">${sym}</div>
+          <div class="opt-name">${d.label}</div>
+        </div>
+        ${priceStr}${pcHtml}
+      </div>
+      ${expTbl}
+      ${levelsHtml}
+      ${insight}
+    </div>`;
+  });
+
+  html+=`</div></div>`;
+  document.getElementById('root').innerHTML=html;
+}
+
 /* ── fetch ── */
 async function refresh(){
   try{
@@ -2245,6 +2636,7 @@ refresh();
 setInterval(refresh,POLL);
 setInterval(()=>{ if(activeTab==='market') renderMarket(); }, 60000);
 setInterval(()=>{ if(activeTab==='mining') renderMining(); }, 120000);
+setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
 </script>
 </body>
 </html>"""
@@ -2262,11 +2654,13 @@ if __name__=='__main__':
     threading.Thread(target=load_sparklines,   daemon=True).start()
     threading.Thread(target=load_market_data,  daemon=True).start()
     threading.Thread(target=load_mining_data,  daemon=True).start()
+    threading.Thread(target=load_options_data, daemon=True).start()
     threading.Thread(target=fundamentals_loop, daemon=True).start()
     threading.Thread(target=technicals_loop,   daemon=True).start()
     threading.Thread(target=sparklines_loop,   daemon=True).start()
     threading.Thread(target=market_loop,       daemon=True).start()
     threading.Thread(target=mining_loop,       daemon=True).start()
+    threading.Thread(target=options_loop,      daemon=True).start()
     threading.Thread(target=start_ws,          daemon=True).start()
     # Solo abre el navegador si estamos corriendo localmente
     if not os.environ.get("PORT"):
