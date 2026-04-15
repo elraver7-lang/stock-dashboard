@@ -253,7 +253,10 @@ def load_market_data():
             pass
     result['breadth'] = breadth
 
-    # ── Fear & Greed Index (CNN) ──────────────────────────────────────────────
+    # ── Fear & Greed Index ────────────────────────────────────────────────────
+    # Try CNN API first; if blocked on Render, fall back to synthetic calculation
+    # using VIX, Put/Call ratio, market breadth, and SP500 momentum
+    fg_result = None
     try:
         r = requests.get(
             'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
@@ -261,17 +264,79 @@ def load_market_data():
             timeout=8
         )
         fg_data = r.json()
-        fg_score = fg_data.get('fear_and_greed', {}).get('score')
+        fg_score  = fg_data.get('fear_and_greed', {}).get('score')
         fg_rating = fg_data.get('fear_and_greed', {}).get('rating', '')
         fg_prev   = fg_data.get('fear_and_greed', {}).get('previous_close')
-        result['fear_greed'] = {
-            'score':  round(float(fg_score), 1) if fg_score is not None else None,
-            'rating': fg_rating,
-            'prev':   round(float(fg_prev), 1)  if fg_prev  is not None else None,
-        }
+        if fg_score is not None:
+            fg_result = {
+                'score':     round(float(fg_score), 1),
+                'rating':    fg_rating,
+                'prev':      round(float(fg_prev), 1) if fg_prev is not None else None,
+                'synthetic': False,
+            }
+            print(f"  ✓ fear_greed (CNN): {fg_result['score']}")
     except Exception as e:
-        print(f"  ✗ fear_greed: {e}")
-        result['fear_greed'] = None
+        print(f"  ✗ CNN fear_greed: {e}")
+
+    # Synthetic fallback — computed from available indicators
+    if fg_result is None:
+        try:
+            components = []
+            # 1. VIX component (inverted): VIX 10→100 (greed), VIX 20→50 (neutral), VIX 40→0 (fear)
+            vix_price = result.get('vix', {}).get('price')
+            if vix_price is not None:
+                vix_score = max(0.0, min(100.0, (40.0 - float(vix_price)) / 30.0 * 100.0))
+                components.append(('VIX', vix_score))
+
+            # 2. Put/Call ratio: 0.5→100 (greed), 0.9→50 (neutral), 1.3→0 (fear)
+            pcall = result.get('breadth', {}).get('pcall')
+            if pcall is not None:
+                pc_score = max(0.0, min(100.0, (1.3 - float(pcall)) / 0.8 * 100.0))
+                components.append(('P/C', pc_score))
+
+            # 3. Advance/Decline breadth: ratio > 3 → greed, ratio 1 → neutral, < 0.4 → fear
+            adv = result.get('breadth', {}).get('adv')
+            dec = result.get('breadth', {}).get('dec')
+            if adv and dec and dec > 0:
+                ratio = float(adv) / float(dec)
+                breadth_score = max(0.0, min(100.0, 50.0 + (ratio - 1.0) * 20.0))
+                components.append(('Breadth', breadth_score))
+
+            # 4. New Highs vs New Lows: all highs→100, all lows→0
+            nhigh = result.get('breadth', {}).get('nhigh')
+            nlow  = result.get('breadth', {}).get('nlow')
+            if nhigh is not None and nlow is not None and (nhigh + nlow) > 0:
+                hl_score = (float(nhigh) / (float(nhigh) + float(nlow))) * 100.0
+                components.append(('H/L', hl_score))
+
+            # 5. TRIN (Arms Index): <0.8 → greed, 1.0 → neutral, >1.5 → fear
+            trin = result.get('breadth', {}).get('trin')
+            if trin is not None:
+                trin_score = max(0.0, min(100.0, (1.5 - float(trin)) / 0.7 * 100.0))
+                components.append(('TRIN', trin_score))
+
+            # 6. SP500 momentum: price vs 20-day avg change
+            sp500 = result.get('sp500', {})
+            sp_chgp = sp500.get('chgp')
+            if sp_chgp is not None:
+                mom_score = max(0.0, min(100.0, 50.0 + float(sp_chgp) * 10.0))
+                components.append(('Momentum', mom_score))
+
+            if components:
+                score = round(sum(v for _, v in components) / len(components), 1)
+                if score >= 75:   rating = 'Extreme Greed'
+                elif score >= 55: rating = 'Greed'
+                elif score >= 45: rating = 'Neutral'
+                elif score >= 25: rating = 'Fear'
+                else:             rating = 'Extreme Fear'
+                fg_result = {'score': score, 'rating': rating, 'prev': None, 'synthetic': True}
+                print(f"  ✓ fear_greed (sintético {len(components)} indicadores): {score} — {rating}")
+            else:
+                print(f"  ✗ fear_greed sintético: sin datos disponibles")
+        except Exception as e:
+            print(f"  ✗ fear_greed sintético: {e}")
+
+    result['fear_greed'] = fg_result
 
     # ── News + Economic Calendar via mktnews.com ──────────────────────────────
     try:
@@ -1581,22 +1646,29 @@ async function renderMarket(){
   }
 
   // ── 2. Fear & Greed ───────────────────────────────────────────────────────
+  const FG_LABELS = {
+    'extreme greed':'CODICIA EXTREMA','greed':'CODICIA',
+    'neutral':'NEUTRAL','fear':'MIEDO','extreme fear':'MIEDO EXTREMO'
+  };
   let fgHtml='<span class="na">Sin datos</span>';
   if(mktData.fear_greed && mktData.fear_greed.score!=null){
     const fg=mktData.fear_greed;
     const sc=fg.score;
-    let cls2='fg-neutral', barCol='#f0c040', lbl=fg.rating||'';
+    let cls2='fg-neutral', barCol='#f0c040';
+    const rawLbl=(fg.rating||'').toLowerCase();
+    const lbl = FG_LABELS[rawLbl] || fg.rating.toUpperCase() || '';
     if(sc>=75){cls2='fg-greed'; barCol='#2ecc71';}
     else if(sc>=55){cls2='fg-fgreed'; barCol='#90d050';}
     else if(sc>=45){cls2='fg-neutral'; barCol='#f0c040';}
     else if(sc>=25){cls2='fg-fear';  barCol='#e09040';}
     else{cls2='fg-xfear'; barCol='#e74c3c';}
-    const prevStr = fg.prev!=null ? `<div style="font-size:.68rem;color:#405060;margin-top:4px">Anterior cierre: ${fg.prev.toFixed(0)}</div>` : '';
+    const prevStr = fg.prev!=null ? `<div style="font-size:.68rem;color:#405060;margin-top:4px">Cierre ant: ${fg.prev.toFixed(0)}</div>` : '';
+    const srcStr  = fg.synthetic ? `<div style="font-size:.60rem;color:#2a4050;margin-top:2px">calculado: VIX · P/C · Breadth · TRIN</div>` : '';
     fgHtml=`<div class="fg-meter">
       <div class="fg-score ${cls2}">${sc.toFixed(0)}</div>
-      <div class="fg-label ${cls2}">${lbl.toUpperCase()}</div>
+      <div class="fg-label ${cls2}">${lbl}</div>
       <div class="fg-bar-wrap"><div class="fg-bar" style="width:${sc}%;background:${barCol}"></div></div>
-      ${prevStr}
+      ${prevStr}${srcStr}
       <div style="display:flex;justify-content:space-between;width:100%;font-size:.62rem;color:#304050;margin-top:3px">
         <span>0 Miedo Extremo</span><span>100 Codicia Extrema</span>
       </div>
