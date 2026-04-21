@@ -2834,6 +2834,260 @@ setInterval(()=>{ if(activeTab==='market') renderMarket(); }, 60000);
 setInterval(()=>{ if(activeTab==='mining') renderMining(); }, 120000);
 setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
 </script>
+
+<!-- Feature Pack: Portfolio Simulator | Position Size Calculator | Export CSV | Ticker Tape -->
+<script>
+(function() {
+  'use strict';
+  if (document.getElementById('mf-css')) return;
+
+  var s = document.createElement('style');
+  s.id = 'mf-css';
+  s.textContent = [
+    '.fab-c{position:fixed;bottom:20px;right:20px;z-index:9990;display:flex;flex-direction:column-reverse;gap:12px;align-items:center}',
+    '.fab-b{width:50px;height:50px;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:22px;box-shadow:0 4px 15px rgba(0,0,0,.4);transition:transform .2s}',
+    '.fab-b:hover{transform:scale(1.15)}',
+    '.fab-b .ft{position:absolute;right:60px;background:#1a2d45;color:#dce8f0;padding:6px 12px;border-radius:8px;font-size:12px;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .2s}',
+    '.fab-b:hover .ft{opacity:1}',
+    '.mo{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:9998;display:none}',
+    '.mo.op{display:block}',
+    '.mp{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);max-width:95vw;max-height:82vh;background:#0d1b2a;border:1px solid #1e3a5f;border-radius:16px;z-index:10000;display:none;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7);overflow:hidden}',
+    '.mp.op{display:flex}',
+    '.mh{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid #1e3a5f;background:linear-gradient(135deg,#142030,#1a2d45)}',
+    '.mh h2{font-size:17px;margin:0}',
+    '.mc{background:none;border:none;color:#8899aa;font-size:22px;cursor:pointer}',
+    '.mc:hover{color:#ff6b6b}',
+    '.mb{padding:18px 20px;overflow-y:auto;flex:1}',
+    '.pi{background:#0a1520;border:1px solid #1e3a5f;color:#dce8f0;padding:8px 12px;border-radius:8px;font-size:13px}',
+    '.pi:focus{border-color:#00c9ff;outline:none}',
+    '.pa{background:linear-gradient(135deg,#00c9ff,#92fe9d);color:#0a1520;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:700;font-size:13px}',
+    '.pt{width:100%;border-collapse:collapse}',
+    '.pt th{text-align:left;padding:8px;font-size:11px;text-transform:uppercase;color:#5a7a96;border-bottom:1px solid #1e3a5f}',
+    '.pt td{padding:8px;font-size:13px;border-bottom:1px solid #0f2234}',
+    '.pg{color:#00e676!important}',
+    '.pl{color:#ff5252!important}',
+    '.pr{background:none;border:none;color:#ff5252;cursor:pointer;font-size:15px}',
+    '.ps{display:flex;justify-content:space-around;padding:14px 20px;border-top:1px solid #1e3a5f;background:#0a1520}',
+    '.pst{text-align:center}',
+    '.psl{font-size:10px;text-transform:uppercase;color:#5a7a96}',
+    '.psv{font-size:18px;font-weight:700;margin-top:2px}',
+    '.cg{display:grid;grid-template-columns:1fr 1fr;gap:14px}',
+    '.cf label{display:block;font-size:11px;color:#5a7a96;text-transform:uppercase;margin-bottom:4px}',
+    '.cf input{width:100%;background:#0a1520;border:1px solid #1e3a5f;color:#dce8f0;padding:10px 12px;border-radius:8px;font-size:14px;box-sizing:border-box}',
+    '.cf input:focus{border-color:#f093fb;outline:none}',
+    '.cr{margin-top:18px;padding:16px;background:#0a1520;border-radius:12px;border:1px solid #1e3a5f}',
+    '.crg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:10px}',
+    '.cri{text-align:center}',
+    '.cri .lb{font-size:10px;text-transform:uppercase;color:#5a7a96}',
+    '.cri .vl{font-size:18px;font-weight:700;margin-top:2px;color:#f093fb}',
+    '.et{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:#1a2d45;color:#92fe9d;padding:12px 24px;border-radius:10px;font-size:14px;z-index:99999;opacity:0;transition:opacity .3s;border:1px solid #00c9ff}',
+    '.et.sh{opacity:1}'
+  ].join('\\n');
+  document.head.appendChild(s);
+
+  var fc = document.createElement('div');
+  fc.className = 'fab-c';
+  fc.innerHTML = '<button class="fab-b" id="fb-p" style="background:linear-gradient(135deg,#00c9ff,#92fe9d)"><span class="ft">Portfolio Simulator</span>\\uD83D\\uDCBC</button>' +
+    '<button class="fab-b" id="fb-c" style="background:linear-gradient(135deg,#f093fb,#f5576c)"><span class="ft">Position Sizer</span>\\uD83D\\uDCD0</button>' +
+    '<button class="fab-b" id="fb-e" style="background:linear-gradient(135deg,#ffd86f,#fc6262)"><span class="ft">Exportar CSV</span>\\uD83D\\uDCE5</button>';
+  document.body.appendChild(fc);
+
+  var po = document.createElement('div'); po.className = 'mo'; po.id = 'po'; document.body.appendChild(po);
+  var pp = document.createElement('div'); pp.className = 'mp'; pp.id = 'pp'; pp.style.width = '720px';
+  pp.innerHTML = '<div class="mh"><h2 style="color:#00c9ff">\\uD83D\\uDCBC Portfolio Simulator</h2><button class="mc" id="pc">&times;</button></div>' +
+    '<div class="mb"><div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">' +
+    '<input class="pi" type="text" id="pt" placeholder="Ticker (ej: AAPL)" style="width:120px">' +
+    '<input class="pi" type="number" id="pq" placeholder="Acciones" style="width:100px" min="1">' +
+    '<input class="pi" type="number" id="pb" placeholder="Precio compra $" style="width:140px" step="0.01">' +
+    '<button class="pa" id="padd">+ Agregar</button></div>' +
+    '<table class="pt"><thead><tr><th>Ticker</th><th>Cant.</th><th>Compra</th><th>Actual</th><th>P&L $</th><th>P&L %</th><th>Valor</th><th></th></tr></thead>' +
+    '<tbody id="ptb"><tr><td colspan="8" style="text-align:center;color:#5a7a96;padding:30px">Agrega acciones para simular tu portfolio</td></tr></tbody></table></div>' +
+    '<div class="ps">' +
+    '<div class="pst"><div class="psl">Invertido</div><div class="psv" id="si">$0</div></div>' +
+    '<div class="pst"><div class="psl">Valor Actual</div><div class="psv" id="sv">$0</div></div>' +
+    '<div class="pst"><div class="psl">P&L Total</div><div class="psv" id="sp">$0</div></div>' +
+    '<div class="pst"><div class="psl">Retorno</div><div class="psv" id="sr">0%</div></div></div>';
+  document.body.appendChild(pp);
+
+  var co = document.createElement('div'); co.className = 'mo'; co.id = 'co'; document.body.appendChild(co);
+  var cp = document.createElement('div'); cp.className = 'mp'; cp.id = 'cp'; cp.style.width = '520px';
+  cp.innerHTML = '<div class="mh"><h2 style="color:#f093fb">\\uD83D\\uDCD0 Position Size Calculator</h2><button class="mc" id="cc">&times;</button></div>' +
+    '<div class="mb"><div class="cg">' +
+    '<div class="cf"><label>Capital Total ($)</label><input type="number" id="c1" value="10000" step="100"></div>' +
+    '<div class="cf"><label>Riesgo por Trade (%)</label><input type="number" id="c2" value="2" step="0.5"></div>' +
+    '<div class="cf"><label>Precio Entrada ($)</label><input type="number" id="c3" placeholder="ej: 150.00" step="0.01"></div>' +
+    '<div class="cf"><label>Stop Loss ($)</label><input type="number" id="c4" placeholder="ej: 145.00" step="0.01"></div></div>' +
+    '<div class="cr" id="cres" style="display:none"><div style="font-size:13px;color:#8899aa;text-transform:uppercase;letter-spacing:1px">Resultado</div>' +
+    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">\\u2014</div></div>' +
+    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">\\u2014</div></div>' +
+    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">\\u2014</div></div></div>' +
+    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">\\u2014</div></div>' +
+    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">\\u2014</div></div>' +
+    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">\\u2014</div></div></div></div></div>';
+  document.body.appendChild(cp);
+
+  var toast = document.createElement('div');
+  toast.className = 'et'; toast.id = 'toast';
+  toast.textContent = 'CSV exportado exitosamente';
+  document.body.appendChild(toast);
+
+  window._pf = [];
+
+  window.findPrice = function(tk) {
+    var tables = document.querySelectorAll('.table-wrap table');
+    var up = tk.toUpperCase();
+    for (var t = 0; t < tables.length; t++) {
+      var rows = tables[t].querySelectorAll('tr');
+      for (var r = 0; r < rows.length; r++) {
+        var tds = rows[r].querySelectorAll('td');
+        if (tds.length < 6) continue;
+        var ct = tds[2] ? tds[2].textContent.trim() : '';
+        if (ct.toUpperCase().indexOf(up) === 0) {
+          var pt = tds[5] ? tds[5].textContent.trim() : '';
+          var p = parseFloat(pt.replace(/[^0-9.]/g, ''));
+          if (p > 0) return p;
+        }
+      }
+    }
+    return null;
+  };
+
+  function tog(pid, oid) {
+    document.getElementById(pid).classList.toggle('op');
+    document.getElementById(oid).classList.toggle('op');
+  }
+
+  document.getElementById('fb-p').onclick = function() { tog('pp', 'po'); upPF(); };
+  document.getElementById('po').onclick = function() { tog('pp', 'po'); };
+  document.getElementById('pc').onclick = function() { tog('pp', 'po'); };
+
+  window.upPF = function() {
+    var tb = document.getElementById('ptb');
+    if (!tb) return;
+    if (!window._pf.length) {
+      tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#5a7a96;padding:30px">Agrega acciones para simular tu portfolio</td></tr>';
+      document.getElementById('si').textContent = '$0';
+      document.getElementById('sv').textContent = '$0';
+      document.getElementById('sp').textContent = '$0';
+      document.getElementById('sr').textContent = '0%';
+      return;
+    }
+    var ti = 0, tv = 0;
+    tb.innerHTML = window._pf.map(function(p, i) {
+      var cur = findPrice(p.t) || p.b;
+      var inv = p.q * p.b, val = p.q * cur, pnl = val - inv, pct = (cur - p.b) / p.b * 100;
+      ti += inv; tv += val;
+      var c = pnl >= 0 ? 'pg' : 'pl', sg = pnl >= 0 ? '+' : '';
+      return '<tr><td><b>' + p.t + '</b></td><td>' + p.q + '</td><td>$' + p.b.toFixed(2) + '</td><td>$' + cur.toFixed(2) + '</td><td class="' + c + '">' + sg + '$' + pnl.toFixed(2) + '</td><td class="' + c + '">' + sg + pct.toFixed(2) + '%</td><td>$' + val.toFixed(2) + '</td><td><button class="pr" onclick="rmPF(' + i + ')">x</button></td></tr>';
+    }).join('');
+    var tp = tv - ti, tr = ti > 0 ? tp / ti * 100 : 0, c = tp >= 0 ? 'pg' : 'pl';
+    document.getElementById('si').textContent = '$' + ti.toLocaleString('en-US', { minimumFractionDigits: 2 });
+    document.getElementById('sv').textContent = '$' + tv.toLocaleString('en-US', { minimumFractionDigits: 2 });
+    document.getElementById('sp').textContent = (tp >= 0 ? '+$' : '-$') + Math.abs(tp).toLocaleString('en-US', { minimumFractionDigits: 2 });
+    document.getElementById('sp').className = 'psv ' + c;
+    document.getElementById('sr').textContent = (tr >= 0 ? '+' : '') + tr.toFixed(2) + '%';
+    document.getElementById('sr').className = 'psv ' + c;
+  };
+
+  document.getElementById('padd').onclick = function() {
+    var t = document.getElementById('pt').value.toUpperCase().trim();
+    var q = parseInt(document.getElementById('pq').value);
+    var b = parseFloat(document.getElementById('pb').value);
+    if (!t || !q || !b) return;
+    window._pf.push({ t: t, q: q, b: b });
+    document.getElementById('pt').value = '';
+    document.getElementById('pq').value = '';
+    document.getElementById('pb').value = '';
+    upPF();
+  };
+  window.rmPF = function(i) { window._pf.splice(i, 1); upPF(); };
+
+  document.getElementById('fb-c').onclick = function() { tog('cp', 'co'); };
+  document.getElementById('co').onclick = function() { tog('cp', 'co'); };
+  document.getElementById('cc').onclick = function() { tog('cp', 'co'); };
+
+  function calc() {
+    var cap = parseFloat(document.getElementById('c1').value);
+    var rp = parseFloat(document.getElementById('c2').value);
+    var en = parseFloat(document.getElementById('c3').value);
+    var sl = parseFloat(document.getElementById('c4').value);
+    if (!cap || !rp || !en || !sl || en === sl) { document.getElementById('cres').style.display = 'none'; return; }
+    var ra = cap * (rp / 100), rps = Math.abs(en - sl), sh = Math.floor(ra / rps), am = sh * en, pc = am / cap * 100;
+    var isL = en > sl, t2 = isL ? en + rps * 2 : en - rps * 2, t3 = isL ? en + rps * 3 : en - rps * 3;
+    document.getElementById('cres').style.display = 'block';
+    document.getElementById('r1').textContent = sh;
+    document.getElementById('r2').textContent = '$' + am.toFixed(2);
+    document.getElementById('r3').textContent = '$' + ra.toFixed(2);
+    document.getElementById('r4').textContent = '$' + t2.toFixed(2);
+    document.getElementById('r5').textContent = '$' + t3.toFixed(2);
+    document.getElementById('r6').textContent = pc.toFixed(1) + '%';
+  }
+  ['c1', 'c2', 'c3', 'c4'].forEach(function(id) {
+    document.getElementById(id).addEventListener('input', calc);
+  });
+
+  document.getElementById('fb-e').onclick = function() {
+    var rows = document.querySelectorAll('.table-wrap tr');
+    var csv = [];
+    rows.forEach(function(row) {
+      var cells = row.querySelectorAll('th,td');
+      if (cells.length >= 5) {
+        csv.push(Array.from(cells).map(function(c) {
+          return '"' + c.textContent.trim().replace(/"/g, '""') + '"';
+        }).join(','));
+      }
+    });
+    if (csv.length < 2) return;
+    var blob = new Blob([csv.join('\\n')], { type: 'text/csv' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'stocks_' + new Date().toISOString().slice(0, 10) + '.csv';
+    a.click();
+    var t = document.getElementById('toast');
+    t.classList.add('sh');
+    setTimeout(function() { t.classList.remove('sh'); }, 2500);
+  };
+
+  var host = document.createElement('div');
+  host.id = 'tape-h';
+  host.setAttribute('style', 'position:fixed !important;bottom:0 !important;left:0 !important;right:0 !important;height:38px !important;z-index:999999 !important;');
+  document.documentElement.appendChild(host);
+  var shadow = host.attachShadow({ mode: 'open' });
+
+  function renderTape() {
+    var stocks = [], seen = {};
+    var tables = document.querySelectorAll('.table-wrap table');
+    for (var t = 0; t < tables.length; t++) {
+      var rows = tables[t].querySelectorAll('tr');
+      for (var r = 0; r < rows.length; r++) {
+        var tds = rows[r].querySelectorAll('td');
+        if (tds.length < 8) continue;
+        var tk = tds[2] ? tds[2].textContent.trim().split(' ')[0].split('\\n')[0] : '';
+        if (!tk || seen[tk]) continue;
+        seen[tk] = true;
+        var price = tds[5] ? tds[5].textContent.trim() : '';
+        var chg = tds[7] ? tds[7].textContent.trim() : '';
+        var up = !chg.includes('-');
+        if (price.indexOf('$') === 0) stocks.push({ t: tk, p: price, c: chg, u: up });
+      }
+    }
+    if (!stocks.length) return;
+    var all = stocks.concat(stocks).concat(stocks);
+    var sp = '';
+    all.forEach(function(s) {
+      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '\\u25B2' : '\\u25BC';
+      sp += '<span style="display:inline-block;margin-right:30px;font-size:13px;font-family:Segoe UI,sans-serif;"><b style="color:#00c9ff;">' + s.t + '</b> <span style="color:#dce8f0;">' + s.p + '</span> <span style="color:' + col + ';">' + arr + ' ' + s.c + '</span></span>';
+    });
+    shadow.innerHTML = '<style>@keyframes sc{0%{transform:translateX(0)}100%{transform:translateX(-66.66%)}}</style>' +
+      '<div style="width:100%;height:38px;background:linear-gradient(90deg,#0a1420,#152535,#0a1420);border-top:1px solid #1e3a5f;display:flex;align-items:center;overflow:hidden;">' +
+      '<div style="display:inline-block;white-space:nowrap;animation:sc 60s linear infinite;">' + sp + '</div></div>';
+  }
+  renderTape();
+  setInterval(renderTape, 15000);
+
+  console.log('Stock Dashboard Feature Pack loaded!');
+})();
+</script>
 </body>
 </html>"""
 
