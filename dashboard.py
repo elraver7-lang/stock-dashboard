@@ -2918,12 +2918,12 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     '<div class="cf"><label>Precio Entrada ($)</label><input type="number" id="c3" placeholder="ej: 150.00" step="0.01"></div>' +
     '<div class="cf"><label>Stop Loss ($)</label><input type="number" id="c4" placeholder="ej: 145.00" step="0.01"></div></div>' +
     '<div class="cr" id="cres" style="display:none"><div style="font-size:13px;color:#8899aa;text-transform:uppercase;letter-spacing:1px">Resultado</div>' +
-    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">\—</div></div>' +
-    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">\—</div></div>' +
-    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">\—</div></div></div>' +
-    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">\—</div></div>' +
-    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">\—</div></div>' +
-    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">\—</div></div></div></div></div>';
+    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">—</div></div>' +
+    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">—</div></div>' +
+    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">—</div></div></div>' +
+    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">—</div></div>' +
+    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">—</div></div>' +
+    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">—</div></div></div></div></div>';
   document.body.appendChild(cp);
 
   var toast = document.createElement('div');
@@ -3075,7 +3075,7 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     var all = stocks.concat(stocks).concat(stocks);
     var sp = '';
     all.forEach(function(s) {
-      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '\▲' : '\▼';
+      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '▲' : '▼';
       sp += '<span style="display:inline-block;margin-right:30px;font-size:13px;font-family:Segoe UI,sans-serif;"><b style="color:#00c9ff;">' + s.t + '</b> <span style="color:#dce8f0;">' + s.p + '</span> <span style="color:' + col + ';">' + arr + ' ' + s.c + '</span></span>';
     });
     shadow.innerHTML = '<style>@keyframes sc{0%{transform:translateX(0)}100%{transform:translateX(-66.66%)}}</style>' +
