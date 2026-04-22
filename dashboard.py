@@ -2887,14 +2887,14 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
 
   var fc = document.createElement('div');
   fc.className = 'fab-c';
-  fc.innerHTML = '<button class="fab-b" id="fb-p" style="background:linear-gradient(135deg,#00c9ff,#92fe9d)"><span class="ft">Portfolio Simulator</span>\\uD83D\\uDCBC</button>' +
-    '<button class="fab-b" id="fb-c" style="background:linear-gradient(135deg,#f093fb,#f5576c)"><span class="ft">Position Sizer</span>\\uD83D\\uDCD0</button>' +
-    '<button class="fab-b" id="fb-e" style="background:linear-gradient(135deg,#ffd86f,#fc6262)"><span class="ft">Exportar CSV</span>\\uD83D\\uDCE5</button>';
+  fc.innerHTML = '<button class="fab-b" id="fb-p" style="background:linear-gradient(135deg,#00c9ff,#92fe9d)"><span class="ft">Portfolio Simulator</span>P</button>' +
+    '<button class="fab-b" id="fb-c" style="background:linear-gradient(135deg,#f093fb,#f5576c)"><span class="ft">Position Sizer</span>C</button>' +
+    '<button class="fab-b" id="fb-e" style="background:linear-gradient(135deg,#ffd86f,#fc6262)"><span class="ft">Exportar CSV</span>E</button>';
   document.body.appendChild(fc);
 
   var po = document.createElement('div'); po.className = 'mo'; po.id = 'po'; document.body.appendChild(po);
   var pp = document.createElement('div'); pp.className = 'mp'; pp.id = 'pp'; pp.style.width = '720px';
-  pp.innerHTML = '<div class="mh"><h2 style="color:#00c9ff">\\uD83D\\uDCBC Portfolio Simulator</h2><button class="mc" id="pc">&times;</button></div>' +
+  pp.innerHTML = '<div class="mh"><h2 style="color:#00c9ff">P Portfolio Simulator</h2><button class="mc" id="pc">&times;</button></div>' +
     '<div class="mb"><div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">' +
     '<input class="pi" type="text" id="pt" placeholder="Ticker (ej: AAPL)" style="width:120px">' +
     '<input class="pi" type="number" id="pq" placeholder="Acciones" style="width:100px" min="1">' +
@@ -2911,19 +2911,19 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
 
   var co = document.createElement('div'); co.className = 'mo'; co.id = 'co'; document.body.appendChild(co);
   var cp = document.createElement('div'); cp.className = 'mp'; cp.id = 'cp'; cp.style.width = '520px';
-  cp.innerHTML = '<div class="mh"><h2 style="color:#f093fb">\\uD83D\\uDCD0 Position Size Calculator</h2><button class="mc" id="cc">&times;</button></div>' +
+  cp.innerHTML = '<div class="mh"><h2 style="color:#f093fb">C Position Size Calculator</h2><button class="mc" id="cc">&times;</button></div>' +
     '<div class="mb"><div class="cg">' +
     '<div class="cf"><label>Capital Total ($)</label><input type="number" id="c1" value="10000" step="100"></div>' +
     '<div class="cf"><label>Riesgo por Trade (%)</label><input type="number" id="c2" value="2" step="0.5"></div>' +
     '<div class="cf"><label>Precio Entrada ($)</label><input type="number" id="c3" placeholder="ej: 150.00" step="0.01"></div>' +
     '<div class="cf"><label>Stop Loss ($)</label><input type="number" id="c4" placeholder="ej: 145.00" step="0.01"></div></div>' +
     '<div class="cr" id="cres" style="display:none"><div style="font-size:13px;color:#8899aa;text-transform:uppercase;letter-spacing:1px">Resultado</div>' +
-    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">\\u2014</div></div>' +
-    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">\\u2014</div></div>' +
-    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">\\u2014</div></div></div>' +
-    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">\\u2014</div></div>' +
-    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">\\u2014</div></div>' +
-    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">\\u2014</div></div></div></div></div>';
+    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">\—</div></div>' +
+    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">\—</div></div>' +
+    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">\—</div></div></div>' +
+    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">\—</div></div>' +
+    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">\—</div></div>' +
+    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">\—</div></div></div></div></div>';
   document.body.appendChild(cp);
 
   var toast = document.createElement('div');
@@ -3075,7 +3075,7 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     var all = stocks.concat(stocks).concat(stocks);
     var sp = '';
     all.forEach(function(s) {
-      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '\\u25B2' : '\\u25BC';
+      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '\▲' : '\▼';
       sp += '<span style="display:inline-block;margin-right:30px;font-size:13px;font-family:Segoe UI,sans-serif;"><b style="color:#00c9ff;">' + s.t + '</b> <span style="color:#dce8f0;">' + s.p + '</span> <span style="color:' + col + ';">' + arr + ' ' + s.c + '</span></span>';
     });
     shadow.innerHTML = '<style>@keyframes sc{0%{transform:translateX(0)}100%{transform:translateX(-66.66%)}}</style>' +
