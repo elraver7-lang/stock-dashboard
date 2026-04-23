@@ -10,11 +10,16 @@ import finnhub, websocket, yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import gc
+import signal
+
+# Timeout for yfinance calls
+yf.set_tz_cache_location("/tmp/yf_cache")
 
 API_KEY        = os.environ.get("FINNHUB_API_KEY", "d764qhpr01qm4b7sv75gd764qhpr01qm4b7sv760")
 PORT           = int(os.environ.get("PORT", 5050))
-POLL_MS        = 3000
-FUND_REFRESH_S = 300
+POLL_MS        = 5000
+FUND_REFRESH_S = 600
 
 REQUESTED   = ["META","GOOGL","MSFT","NVDA","ORCL","MU","NFLX","SPOT","TSLA","NOW","NU","PAGS","STNE"]
 RECOMMENDED = ["AMZN","AMD","V","ASML","JPM","BABA","MELI","ADBE","AVGO","QCOM","CRM","MRVL","TXN","SHOP","UBER","APP","PANW"]
@@ -475,7 +480,8 @@ def load_market_data():
 
 def market_loop():
     while True:
-        time.sleep(300)   # refresh cada 5 min
+        time.sleep(600)
+        gc.collect()   # refresh cada 5 min
         load_market_data()
 
 def load_mining_data():
@@ -564,7 +570,8 @@ def load_mining_data():
 
 def mining_loop():
     while True:
-        time.sleep(600)   # refresh cada 10 min
+        time.sleep(600)
+        gc.collect()   # refresh cada 10 min
         load_mining_data()
 
 # ── Options helpers ───────────────────────────────────────────────────────────
@@ -891,7 +898,8 @@ def load_options_data():
 
 def options_loop():
     while True:
-        time.sleep(900)   # refresh cada 15 min
+        time.sleep(900)
+        gc.collect()   # refresh cada 15 min
         load_options_data()
 
 # ── technical helpers ─────────────────────────────────────────────────────────
@@ -979,6 +987,7 @@ def load_technicals():
 def technicals_loop():
     while True:
         time.sleep(900)
+        gc.collect()
         print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando indicadores técnicos...")
         load_technicals()
 
@@ -996,7 +1005,8 @@ def load_sparklines():
 
 def sparklines_loop():
     while True:
-        time.sleep(1800)   # refresh cada 30 min
+        time.sleep(1800)
+        gc.collect()   # refresh cada 30 min
         print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando sparklines...")
         load_sparklines()
 
@@ -1128,6 +1138,12 @@ def load_fundamentals():
 def fundamentals_loop():
     while True:
         time.sleep(FUND_REFRESH_S)
+        gc.collect()
+        try:
+            import resource
+            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            print(f"  [MEM] {mem_mb:.0f} MB")
+        except: pass
         print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando fundamentals...")
         load_fundamentals()
 
@@ -1150,7 +1166,7 @@ def on_message(ws_app, message):
 
 def on_error(ws_app,e): print(f"WS error: {e}")
 def on_close(ws_app,c,m):
-    print("WS cerrado, reconectando..."); time.sleep(5); start_ws()
+    print("WS cerrado, reconectando en 10s..."); time.sleep(10); start_ws()
 def on_open(ws_app):
     print(f"[{time.strftime('%H:%M:%S')}] WS conectado, suscribiendo {len(ALL_TICKERS)} tickers...")
     for sym in ALL_TICKERS:
@@ -3100,10 +3116,15 @@ if __name__=='__main__':
     # Todos los datos cargan en background — Flask arranca PRIMERO
     # para que Render/cloud reciba el health-check sin timeout
     threading.Thread(target=load_fundamentals, daemon=True).start()
+    time.sleep(15)  # stagger startup to avoid memory spike
     threading.Thread(target=load_technicals,   daemon=True).start()
+    time.sleep(10)
     threading.Thread(target=load_sparklines,   daemon=True).start()
+    time.sleep(10)
     threading.Thread(target=load_market_data,  daemon=True).start()
+    time.sleep(10)
     threading.Thread(target=load_mining_data,  daemon=True).start()
+    time.sleep(15)
     threading.Thread(target=load_options_data, daemon=True).start()
     threading.Thread(target=fundamentals_loop, daemon=True).start()
     threading.Thread(target=technicals_loop,   daemon=True).start()
