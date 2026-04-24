@@ -481,8 +481,11 @@ def load_market_data():
 def market_loop():
     while True:
         time.sleep(600)
-        gc.collect()   # refresh cada 5 min
-        load_market_data()
+        gc.collect()
+        try:
+            load_market_data()
+        except Exception as e:
+            print(f"[market_loop] Error: {e}")
 
 def load_mining_data():
     """Fetch prices, 30d range, 52w range, RSI-14, ATR-14 for commodities & miners."""
@@ -571,8 +574,11 @@ def load_mining_data():
 def mining_loop():
     while True:
         time.sleep(600)
-        gc.collect()   # refresh cada 10 min
-        load_mining_data()
+        gc.collect()
+        try:
+            load_mining_data()
+        except Exception as e:
+            print(f"[mining_loop] Error: {e}")
 
 # ── Options helpers ───────────────────────────────────────────────────────────
 # BTC uses Deribit (yfinance BTC-USD has no options market)
@@ -899,8 +905,11 @@ def load_options_data():
 def options_loop():
     while True:
         time.sleep(900)
-        gc.collect()   # refresh cada 15 min
-        load_options_data()
+        gc.collect()
+        try:
+            load_options_data()
+        except Exception as e:
+            print(f"[options_loop] Error: {e}")
 
 # ── technical helpers ─────────────────────────────────────────────────────────
 def _rsi(series, period=14):
@@ -988,8 +997,11 @@ def technicals_loop():
     while True:
         time.sleep(900)
         gc.collect()
-        print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando indicadores técnicos...")
-        load_technicals()
+        try:
+            print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando indicadores técnicos...")
+            load_technicals()
+        except Exception as e:
+            print(f"[technicals_loop] Error: {e}")
 
 def load_sparklines():
     for ticker in ALL_TICKERS:
@@ -1006,9 +1018,12 @@ def load_sparklines():
 def sparklines_loop():
     while True:
         time.sleep(1800)
-        gc.collect()   # refresh cada 30 min
-        print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando sparklines...")
-        load_sparklines()
+        gc.collect()
+        try:
+            print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando sparklines...")
+            load_sparklines()
+        except Exception as e:
+            print(f"[sparklines_loop] Error: {e}")
 
 def safe(d, *keys, default=None):
     for k in keys:
@@ -1166,7 +1181,8 @@ def on_message(ws_app, message):
 
 def on_error(ws_app,e): print(f"WS error: {e}")
 def on_close(ws_app,c,m):
-    print("WS cerrado, reconectando en 10s..."); time.sleep(10); start_ws()
+    # FIX: no llamar start_ws() aquí — causaría stack overflow por recursión infinita
+    print(f"[{time.strftime('%H:%M:%S')}] WS cerrado. Loop de reconexión retomará en 5s.")
 def on_open(ws_app):
     print(f"[{time.strftime('%H:%M:%S')}] WS conectado, suscribiendo {len(ALL_TICKERS)} tickers...")
     for sym in ALL_TICKERS:
@@ -1174,9 +1190,19 @@ def on_open(ws_app):
     print("Suscripciones activas ✓")
 
 def start_ws():
-    ws_app = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={API_KEY}",
-        on_message=on_message,on_error=on_error,on_close=on_close,on_open=on_open)
-    ws_app.run_forever(ping_interval=30,ping_timeout=10)
+    """Loop de reconexión — nunca retorna. Reconecta con backoff exponencial."""
+    _delay = 5
+    while True:
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] Iniciando WebSocket Finnhub...")
+            ws_app = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={API_KEY}",
+                on_message=on_message,on_error=on_error,on_close=on_close,on_open=on_open)
+            ws_app.run_forever(ping_interval=30,ping_timeout=10)
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] WS excepción: {e}")
+        print(f"[{time.strftime('%H:%M:%S')}] WS desconectado. Reconectando en {_delay:.0f}s...")
+        time.sleep(_delay)
+        _delay = min(_delay * 1.5, 60)
 
 app = Flask(__name__)
 
@@ -2831,17 +2857,38 @@ async function renderOptions(){
 }
 
 /* ── fetch ── */
+// FIX: tabs que usan renderAll() — market/mining/options tienen sus propios renderers
+const STOCK_TABS = new Set(['prices','valuation','growth','technical','analysts']);
+let _fetchErrCount=0;
 async function refresh(){
+  let fetchOk=false;
   try{
-    const j=await(await fetch('/api/stocks')).json();
+    const ctrl=new AbortController();
+    const tid=setTimeout(()=>ctrl.abort(),8000);
+    const j=await(await fetch('/api/stocks',{signal:ctrl.signal})).json();
+    clearTimeout(tid);
+    fetchOk=true;
+    _fetchErrCount=0;
     allData=markTopPicks(j.data);
     const liveN=j.data.filter(s=>s.source==='live').length;
     const lel=document.getElementById('live-count');
     if(liveN>0){lel.textContent=`🟢 LIVE ${liveN}/${j.data.length}`;lel.style.display='';}
     else lel.style.display='none';
     document.getElementById('updated').textContent=j.updated_at;
-    if(activeTab!=='market') renderAll();
-  }catch(e){document.getElementById('updated').textContent='Error: '+e.message;}
+    // FIX: solo llamar renderAll() para tabs que están en STOCK_TABS
+    // (mining/options/market tienen sus propios render functions — llamar renderAll()
+    //  en ellas crashea con TypeError porque TABS[tab] es undefined)
+    if(STOCK_TABS.has(activeTab)) renderAll();
+  }catch(e){
+    if(!fetchOk){
+      _fetchErrCount++;
+      const el=document.getElementById('updated');
+      if(el) el.textContent=`⚠ Sin conexión (${_fetchErrCount}x) — reintentando...`;
+      if(_fetchErrCount>=10) window.location.reload();
+    } else {
+      console.warn('refresh render error:',e.message);
+    }
+  }
 }
 
 refresh();
