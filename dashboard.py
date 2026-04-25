@@ -1,31 +1,23 @@
 """
-dashboard.py  —  Real-Time USA Stock Dashboard (Finnhub WebSocket)
-Uso:  pip install flask finnhub-python websocket-client
+dashboard.py  —  Real-Time USA Stock Dashboard (yfinance Polling)
+Uso:  pip install flask yfinance pandas numpy requests
       python dashboard.py  →  http://localhost:5050
 """
 import threading, time, json, webbrowser, os
 from flask import Flask, jsonify, render_template_string
 from datetime import datetime, timedelta, timezone
-import finnhub, websocket, yfinance as yf
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-import gc
-import signal
-
-# Timeout for yfinance calls
-yf.set_tz_cache_location("/tmp/yf_cache")
-
-API_KEY        = os.environ.get("FINNHUB_API_KEY", "d764qhpr01qm4b7sv75gd764qhpr01qm4b7sv760")
 PORT           = int(os.environ.get("PORT", 5050))
-POLL_MS        = 5000
-FUND_REFRESH_S = 600
-
+POLL_MS        = 30000   # intervalo de refresco del frontend (ms)
+PRICE_POLL_S   = 30      # intervalo de polling de precios en backend (seg)
+FUND_REFRESH_S = 300
 REQUESTED   = ["META","GOOGL","MSFT","NVDA","ORCL","MU","NFLX","SPOT","TSLA","NOW","NU","PAGS","STNE"]
 RECOMMENDED = ["AMZN","AMD","V","ASML","JPM","BABA","MELI","ADBE","AVGO","QCOM","CRM","MRVL","TXN","SHOP","UBER","APP","PANW"]
 AI_GROWTH   = ["NBIS","ASTS","ONDS","IREN","RKLB","PLTR","ARM","SMCI","CRWD","NET","ANET","IONQ"]
 ALL_TICKERS = REQUESTED + RECOMMENDED + AI_GROWTH
-
 # ── Materias Primas & Mineras ─────────────────────────────────────────────────
 COMMODITY_ITEMS = [
     # ── Materias primas (Futuros / ETFs puros) ──
@@ -60,7 +52,6 @@ COMMODITY_ITEMS = [
     ('BHP',   'BHP Group',                'diversified'),
     ('CLF',   'Cleveland-Cliffs',         'diversified'),
 ]
-
 _prices     = {}
 _info       = {}
 _tech       = {}
@@ -69,8 +60,7 @@ _market     = {}   # market summary data
 _mining     = {}   # mining/commodities data
 _options    = {}   # options flow data
 _lock       = threading.Lock()
-fc = finnhub.Client(api_key=API_KEY)
-
+# (sin cliente Finnhub — todo via yfinance)
 # ── Top S&P500 tickers para top movers ───────────────────────────────────────
 SP500_SAMPLE = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V",
@@ -83,7 +73,6 @@ SP500_SAMPLE = [
     "PYPL","SNAP","PINS","RBLX","COIN","HOOD","SOFI","RIVN","LCID","F",
     "GE","BA","MMM","HON","ETN","EMR","ROK","PH","DOV","IR"
 ]
-
 def _compute_bias(hist_d, hist_4h=None):
     """Return (daily_bias, h4_bias) as 'long'/'short'/'neutral'"""
     try:
@@ -105,7 +94,6 @@ def _compute_bias(hist_d, hist_4h=None):
     except Exception:
         daily_bias = 'neutral'
         rsi = None
-
     h4_bias = 'neutral'
     if hist_4h is not None and not hist_4h.empty and len(hist_4h) >= 20:
         try:
@@ -123,9 +111,7 @@ def _compute_bias(hist_d, hist_4h=None):
             elif bears4 >= 3: h4_bias = 'short'
         except Exception:
             pass
-
     return daily_bias, h4_bias
-
 def _pivot_levels(hist):
     """Classic floor pivot points from last completed candle"""
     try:
@@ -141,21 +127,18 @@ def _pivot_levels(hist):
         return {'pivot': round(P,2), 'R1':R1,'R2':R2,'R3':R3,'S1':S1,'S2':S2,'S3':S3}
     except Exception:
         return None
-
 COUNTRY_FLAGS = {
     'US':'🇺🇸','EU':'🇪🇺','GB':'🇬🇧','JP':'🇯🇵','CN':'🇨🇳',
     'DE':'🇩🇪','FR':'🇫🇷','CA':'🇨🇦','AU':'🇦🇺','NZ':'🇳🇿',
     'CH':'🇨🇭','IT':'🇮🇹','ES':'🇪🇸',
 }
 MAJOR_COUNTRIES = {'US','EU','GB','JP','CN','DE','FR','CA','AU'}
-
 def _fetch_mktnews():
     """Fetch mktnews flash feed (news + economic indicators)."""
     ts  = int(time.time() * 1000)
     url = f'https://static.mktnews.net/json/flash/en.json?t={ts}'
     r   = requests.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=12)
     return r.json() if r.status_code == 200 else []
-
 def _parse_mktnews(items):
     """Split mktnews feed into (news_list, calendar_list)."""
     news, calendar = [], []
@@ -203,12 +186,10 @@ def _parse_mktnews(items):
     news.sort(key=lambda x: x['datetime'], reverse=True)
     calendar.sort(key=lambda x: x['time'])
     return news[:25], calendar[:30]
-
 def load_market_data():
     """Load macro market summary: indices, VIX, yields, DXY, sectors, breadth, fear&greed, calendar, movers."""
     print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de mercado...")
     result = {}
-
     # ── Macro instruments ────────────────────────────────────────────────────
     INSTRUMENTS = {
         'sp500': '^GSPC',
@@ -252,7 +233,6 @@ def load_market_data():
             time.sleep(0.3)
         except Exception as e:
             print(f"  ✗ market {key}: {e}")
-
     # ── Sector ETFs ──────────────────────────────────────────────────────────
     SECTOR_ETFS = {
         'XLK':'Tecnología','XLF':'Financiero','XLE':'Energía',
@@ -275,7 +255,6 @@ def load_market_data():
     except Exception as e:
         print(f"  ✗ sectors: {e}")
     result['sectors'] = sectors
-
     # ── Market Breadth ───────────────────────────────────────────────────────
     breadth = {}
     BREADTH_TICKERS = {
@@ -295,7 +274,6 @@ def load_market_data():
         except Exception:
             pass
     result['breadth'] = breadth
-
     # ── Fear & Greed Index ────────────────────────────────────────────────────
     # Try CNN API first; if blocked on Render, fall back to synthetic calculation
     # using VIX, Put/Call ratio, market breadth, and SP500 momentum
@@ -320,7 +298,6 @@ def load_market_data():
             print(f"  ✓ fear_greed (CNN): {fg_result['score']}")
     except Exception as e:
         print(f"  ✗ CNN fear_greed: {e}")
-
     # Synthetic fallback — computed from available indicators
     if fg_result is None:
         try:
@@ -330,13 +307,11 @@ def load_market_data():
             if vix_price is not None:
                 vix_score = max(0.0, min(100.0, (40.0 - float(vix_price)) / 30.0 * 100.0))
                 components.append(('VIX', vix_score))
-
             # 2. Put/Call ratio: 0.5→100 (greed), 0.9→50 (neutral), 1.3→0 (fear)
             pcall = result.get('breadth', {}).get('pcall')
             if pcall is not None:
                 pc_score = max(0.0, min(100.0, (1.3 - float(pcall)) / 0.8 * 100.0))
                 components.append(('P/C', pc_score))
-
             # 3. Advance/Decline breadth: ratio > 3 → greed, ratio 1 → neutral, < 0.4 → fear
             adv = result.get('breadth', {}).get('adv')
             dec = result.get('breadth', {}).get('dec')
@@ -344,27 +319,23 @@ def load_market_data():
                 ratio = float(adv) / float(dec)
                 breadth_score = max(0.0, min(100.0, 50.0 + (ratio - 1.0) * 20.0))
                 components.append(('Breadth', breadth_score))
-
             # 4. New Highs vs New Lows: all highs→100, all lows→0
             nhigh = result.get('breadth', {}).get('nhigh')
             nlow  = result.get('breadth', {}).get('nlow')
             if nhigh is not None and nlow is not None and (nhigh + nlow) > 0:
                 hl_score = (float(nhigh) / (float(nhigh) + float(nlow))) * 100.0
                 components.append(('H/L', hl_score))
-
             # 5. TRIN (Arms Index): <0.8 → greed, 1.0 → neutral, >1.5 → fear
             trin = result.get('breadth', {}).get('trin')
             if trin is not None:
                 trin_score = max(0.0, min(100.0, (1.5 - float(trin)) / 0.7 * 100.0))
                 components.append(('TRIN', trin_score))
-
             # 6. SP500 momentum: price vs 20-day avg change
             sp500 = result.get('sp500', {})
             sp_chgp = sp500.get('chgp')
             if sp_chgp is not None:
                 mom_score = max(0.0, min(100.0, 50.0 + float(sp_chgp) * 10.0))
                 components.append(('Momentum', mom_score))
-
             if components:
                 score = round(sum(v for _, v in components) / len(components), 1)
                 if score >= 75:   rating = 'Extreme Greed'
@@ -378,9 +349,7 @@ def load_market_data():
                 print(f"  ✗ fear_greed sintético: sin datos disponibles")
         except Exception as e:
             print(f"  ✗ fear_greed sintético: {e}")
-
     result['fear_greed'] = fg_result
-
     # ── News + Economic Calendar via mktnews.com ──────────────────────────────
     try:
         mktnews_items         = _fetch_mktnews()
@@ -392,34 +361,43 @@ def load_market_data():
         print(f"  ✗ mktnews: {e}")
         result['news']          = []
         result['econ_calendar'] = []
-
-    # ── Earnings Calendar (próximos 14 días para tickers seguidos) ────────────
+    # ── Earnings Calendar (próximos 14 días para tickers seguidos) — vía yfinance ──
     try:
-        now = datetime.now()
-        earnings_raw = fc.earnings_calendar(
-            _from=now.strftime('%Y-%m-%d'),
-            to=(now + timedelta(days=14)).strftime('%Y-%m-%d'),
-            symbol=None, international=False
-        )
         tracked_set = set(ALL_TICKERS)
         earnings = []
-        for e in (earnings_raw.get('earningsCalendar') or []):
-            sym = e.get('symbol','')
-            if sym not in tracked_set: continue
-            earnings.append({
-                'ticker': sym,
-                'date':   e.get('date',''),
-                'hour':   e.get('hour',''),          # bmo / amc / dmh
-                'eps_est':e.get('epsEstimate'),
-                'eps_act':e.get('epsActual'),
-                'rev_est':e.get('revenueEstimate'),
-            })
+        for sym in ALL_TICKERS:
+            try:
+                cal = yf.Ticker(sym).calendar
+                if cal is None or cal.empty:
+                    continue
+                # El calendario de yfinance devuelve un DataFrame; la primera columna es la fecha
+                for col in cal.columns:
+                    row = cal[col]
+                    earn_date = row.get('Earnings Date')
+                    if earn_date is None:
+                        continue
+                    try:
+                        earn_dt = pd.Timestamp(earn_date)
+                        date_str = earn_dt.strftime('%Y-%m-%d')
+                    except Exception:
+                        date_str = str(earn_date)
+                    earnings.append({
+                        'ticker':  sym,
+                        'date':    date_str,
+                        'hour':    '',
+                        'eps_est': row.get('EPS Estimate'),
+                        'eps_act': row.get('Reported EPS'),
+                        'rev_est': row.get('Revenue Estimate'),
+                    })
+                time.sleep(0.2)
+            except Exception:
+                pass
         earnings.sort(key=lambda x: x['date'])
         result['earnings'] = earnings
+        print(f"  ✓ earnings: {len(earnings)} eventos")
     except Exception as e:
         print(f"  ✗ earnings: {e}")
         result['earnings'] = []
-
     # ── Pre-market movers ─────────────────────────────────────────────────────
     pre_movers = []
     try:
@@ -445,7 +423,6 @@ def load_market_data():
     except Exception as e:
         print(f"  ✗ pre_movers: {e}")
     result['pre_movers'] = pre_movers[:20]
-
     # ── Top movers (S&P500 sample — sesión previa) ───────────────────────────
     movers = []
     try:
@@ -472,21 +449,17 @@ def load_market_data():
         print(f"  ✗ top_movers: {e}")
         result['top_gainers'] = []
         result['top_losers']  = []
-
     result['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
     with _lock:
         _market.update(result)
     print(f"[{time.strftime('%H:%M:%S')}] Datos de mercado listos ✓")
-
 def market_loop():
     while True:
-        time.sleep(600)
-        gc.collect()
+        time.sleep(300)   # refresh cada 5 min
         try:
             load_market_data()
         except Exception as e:
             print(f"[market_loop] Error: {e}")
-
 def load_mining_data():
     """Fetch prices, 30d range, 52w range, RSI-14, ATR-14 for commodities & miners."""
     print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de materias primas y mineras...")
@@ -502,7 +475,6 @@ def load_mining_data():
             prev   = float(close.iloc[-2]) if len(close) > 1 else price
             chg    = round(price - prev, 6)
             chgp   = round((chg / prev) * 100, 2) if prev else 0
-
             # ── 30-day range ────────────────────────────────────────────────
             h30    = hist.tail(30)
             hi30   = float(h30['High'].max())
@@ -512,17 +484,14 @@ def load_mining_data():
             # position in 30d range 0=min 100=max
             rng30  = hi30 - lo30
             pos30  = round(((price - lo30) / rng30) * 100, 1) if rng30 > 0 else 50
-
             # ── 52-week range ───────────────────────────────────────────────
             hi52   = float(hist['High'].max())
             lo52   = float(hist['Low'].min())
             d52h   = round(((price - hi52) / hi52) * 100, 1) if hi52 else None
             rng52  = hi52 - lo52
             pos52  = round(((price - lo52) / rng52) * 100, 1) if rng52 > 0 else 50
-
             # ── RSI-14 ──────────────────────────────────────────────────────
             rsi = round(float(_rsi(close)), 1) if len(close) >= 15 else None
-
             # ── ATR-14 ──────────────────────────────────────────────────────
             atr14 = None
             atr_pct = None
@@ -531,7 +500,6 @@ def load_mining_data():
                 tr  = pd.concat([hi - lo2, (hi - pc).abs(), (lo2 - pc).abs()], axis=1).max(axis=1)
                 atr14   = round(float(tr.ewm(span=14, adjust=False).mean().iloc[-1]), 4)
                 atr_pct = round((atr14 / price) * 100, 2) if price else None
-
             # ── Volume (only stocks/ETFs, not futures) ──────────────────────
             volume = None
             if '=F' not in ticker:
@@ -539,7 +507,6 @@ def load_mining_data():
                     volume = int(hist['Volume'].iloc[-1])
                 except Exception:
                     pass
-
             items_out.append({
                 'ticker':  ticker,
                 'name':    name,
@@ -565,34 +532,28 @@ def load_mining_data():
             time.sleep(0.3)
         except Exception as e:
             print(f"  ✗ mining {ticker}: {e}")
-
     with _lock:
         _mining['items']      = items_out
         _mining['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
     print(f"[{time.strftime('%H:%M:%S')}] Materias primas listas: {len(items_out)} activos ✓")
-
 def mining_loop():
     while True:
-        time.sleep(600)
-        gc.collect()
+        time.sleep(600)   # refresh cada 10 min
         try:
             load_mining_data()
         except Exception as e:
             print(f"[mining_loop] Error: {e}")
-
 # ── Options helpers ───────────────────────────────────────────────────────────
 # BTC uses Deribit (yfinance BTC-USD has no options market)
 # SPY, SLV, GGAL use yfinance / CBOE data
 OPTIONS_YF_TICKERS  = {'SPY':'SPY — S&P 500 ETF', 'SLV':'Silver ETF (SLV)', 'GGAL':'Galicia (GGAL)'}
 OPTIONS_ALL_LABELS  = {'SPY':'SPY — S&P 500 ETF', 'BTC':'Bitcoin (BTC) — Deribit',
                        'SLV':'Silver ETF (SLV)',   'GGAL':'Galicia (GGAL)'}
-
 def _exp_flags(dt):
     """Is this expiry monthly (3rd Friday) or quarterly (3rd Friday of Mar/Jun/Sep/Dec)?"""
     is_m = (dt.weekday() == 4 and 14 < dt.day <= 21)
     is_q = is_m and dt.month in (3, 6, 9, 12)
     return is_m, is_q
-
 def _max_pain_np(c_k, c_oi, p_k, p_oi):
     """Vectorized max-pain via numpy."""
     try:
@@ -604,7 +565,6 @@ def _max_pain_np(c_k, c_oi, p_k, p_oi):
         return float(round(strikes[np.argmin(pain)], 2))
     except Exception:
         return None
-
 def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
     """
     Fast vectorized gamma levels with flow signal.
@@ -619,7 +579,6 @@ def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
             if current_price and current_price > 0:
                 df = df[df['strike'].between(current_price * 0.78, current_price * 1.22)]
             if df.empty: continue
-
             sub = pd.DataFrame()
             sub['strike'] = df['strike'].round(2).values
             sub['oi']     = df['openInterest'].fillna(0).astype(int).values  if 'openInterest'       in cols else 0
@@ -631,15 +590,12 @@ def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
             sub['itm']    = df['inTheMoney'].fillna(False).astype(bool).values if 'inTheMoney'        in cols else False
             sub['side']   = side
             parts.append(sub)
-
         if not parts: return []
         all_d = pd.concat(parts, ignore_index=True)
-
         # Flow score: (last - bid) / (ask - bid), clipped [0,1]. Only valid when spread > 0
         spread = all_d['ask'] - all_d['bid']
         valid  = (spread > 0.001) & (all_d['last'] > 0)
         all_d['flow'] = np.where(valid, ((all_d['last'] - all_d['bid']) / spread).clip(0, 1), np.nan)
-
         # Group by (strike, side)
         g = all_d.groupby(['strike','side']).agg(
             oi=('oi','sum'), vol=('vol','sum'),
@@ -647,7 +603,6 @@ def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
             flow=('flow','mean'),  # mean of flow scores across same strike
             itm=('itm','any'),
         ).reset_index()
-
         # Pivot to one row per strike
         calls_g = g[g['side']=='c'].set_index('strike').add_prefix('c_').drop(columns=['c_side'])
         puts_g  = g[g['side']=='p'].set_index('strike').add_prefix('p_').drop(columns=['p_side'])
@@ -655,7 +610,6 @@ def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
         merged['total_oi']  = merged['c_oi'] + merged['p_oi']
         merged['total_vol'] = merged['c_vol'] + merged['p_vol']
         merged = merged.nlargest(n, 'total_oi')
-
         items = []
         for strike_val, row in merged.iterrows():
             dist = round(((strike_val - current_price) / current_price)*100, 1) if current_price else None
@@ -664,11 +618,9 @@ def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
             elif abs(dist) <= 1.5:        moneyness = 'ATM'
             elif strike_val > current_price: moneyness = 'OTM' if dominant == 'call' else 'ITM'
             else:                          moneyness = 'ITM' if dominant == 'call' else 'OTM'
-
             def safe_flow(v):
                 try: return round(float(v), 2) if not np.isnan(v) else None
                 except: return None
-
             items.append({
                 'strike':    round(float(strike_val), 2),
                 'c_oi':      int(row['c_oi']),
@@ -689,33 +641,27 @@ def _gamma_levels_df(calls_df, puts_df, current_price, n=10):
     except Exception as e:
         print(f"  ✗ _gamma_levels_df: {e}")
         return []
-
 def _process_chain_expiry(t, exp, cur_price, exp_info):
     """Fetch + process a single expiry date from yfinance; returns expiry dict or None."""
     try:
         chain  = t.option_chain(exp)
         calls, puts = chain.calls, chain.puts
-
         def safe_col(df, col):
             return df[col].fillna(0) if col in df.columns else pd.Series(0, index=df.index)
-
         c_oi   = int(safe_col(calls,'openInterest').sum())
         p_oi   = int(safe_col(puts, 'openInterest').sum())
         c_vol  = int(safe_col(calls,'volume').sum())
         p_vol  = int(safe_col(puts, 'volume').sum())
         pc_oi  = round(p_oi / c_oi,  2) if c_oi  > 0 else None
         pc_vol = round(p_vol / c_vol, 2) if c_vol > 0 else None
-
         c_k  = calls['strike'].values         if not calls.empty else np.array([])
         c_oi_v = safe_col(calls,'openInterest').values if not calls.empty else np.array([])
         p_k  = puts['strike'].values          if not puts.empty else np.array([])
         p_oi_v = safe_col(puts, 'openInterest').values if not puts.empty else np.array([])
         mp   = _max_pain_np(c_k, c_oi_v, p_k, p_oi_v)
         mp_dist = round(((mp - cur_price) / cur_price)*100, 1) if mp and cur_price else None
-
         levels = _gamma_levels_df(calls, puts, cur_price, n=10)
         dte    = max((datetime.strptime(exp,'%Y-%m-%d') - datetime.now()).days, 0)
-
         return {
             'date': exp, 'dte': dte,
             'monthly': exp_info['monthly'], 'quarterly': exp_info['quarterly'],
@@ -726,7 +672,6 @@ def _process_chain_expiry(t, exp, cur_price, exp_info):
     except Exception as e:
         print(f"    ✗ {exp}: {e}")
         return None
-
 def _load_yf_options(sym, label, n_exp=5):
     """Load options for a single yfinance-supported ticker."""
     try:
@@ -735,13 +680,11 @@ def _load_yf_options(sym, label, n_exp=5):
         if not all_exp:
             print(f"    ✗ {sym}: sin vencimientos en yfinance")
             return None
-
         cur_price = None
         try:
             h = t.history(period='2d', interval='1d')
             if not h.empty: cur_price = round(float(h['Close'].iloc[-1]), 4)
         except Exception: pass
-
         expiries_out, total_c, total_p = [], 0, 0
         for exp in all_exp[:n_exp]:
             dt        = datetime.strptime(exp,'%Y-%m-%d')
@@ -753,7 +696,6 @@ def _load_yf_options(sym, label, n_exp=5):
                 total_c += row['c_oi']
                 total_p += row['p_oi']
             time.sleep(0.8)
-
         agg_pc = round(total_p / total_c, 2) if total_c > 0 else None
         print(f"    ✓ {sym}  {len(expiries_out)} vencimientos  P/C={agg_pc}")
         return {
@@ -765,7 +707,6 @@ def _load_yf_options(sym, label, n_exp=5):
     except Exception as e:
         print(f"    ✗ {sym}: {e}")
         return None
-
 def _load_btc_options_deribit():
     """Fetch BTC options from Deribit public API (no auth required)."""
     import re as _re
@@ -782,14 +723,12 @@ def _load_btc_options_deribit():
             print("    ✗ BTC Deribit: sin datos"); return None
     except Exception as e:
         print(f"    ✗ BTC Deribit fetch: {e}"); return None
-
     # Current BTC price from yfinance as fallback
     cur_price = None
     try:
         h = yf.Ticker('BTC-USD').history(period='2d', interval='1d')
         if not h.empty: cur_price = round(float(h['Close'].iloc[-1]), 0)
     except Exception: pass
-
     # Group by expiry
     from collections import defaultdict
     by_exp = defaultdict(lambda: {'c':[], 'p':[]})
@@ -808,7 +747,6 @@ def _load_btc_options_deribit():
             'vol':    float(item.get('volume',0)),
             'iv':     float(item.get('mark_iv',0)),
         })
-
     expiries_out, total_c, total_p = [], 0, 0
     for exp in sorted(by_exp.keys())[:6]:
         calls_list = by_exp[exp]['c']
@@ -818,7 +756,6 @@ def _load_btc_options_deribit():
         c_vol = int(sum(x['vol'] for x in calls_list))
         p_vol = int(sum(x['vol'] for x in puts_list))
         pc_oi = round(p_oi/c_oi, 2) if c_oi > 0 else None
-
         # max pain via numpy
         if calls_list and puts_list:
             c_k   = np.array([x['strike'] for x in calls_list])
@@ -829,7 +766,6 @@ def _load_btc_options_deribit():
         else:
             mp = None
         mp_dist = round(((mp - cur_price)/cur_price)*100, 1) if mp and cur_price else None
-
         # key OI levels (filter ±25% and top 10)
         all_strikes = {}
         for x in calls_list:
@@ -857,7 +793,6 @@ def _load_btc_options_deribit():
                 elif v['strike']>cur_price: v['moneyness']='OTM' if v['dominant']=='call' else 'ITM'
                 else: v['moneyness']='ITM' if v['dominant']=='call' else 'OTM'
         levels = sorted(all_strikes.values(), key=lambda x: x['total_oi'], reverse=True)[:10]
-
         dt = datetime.strptime(exp,'%Y-%m-%d')
         is_m, is_q = _exp_flags(dt)
         dte = max((dt - datetime.now()).days, 0)
@@ -867,10 +802,8 @@ def _load_btc_options_deribit():
             'pc_oi':pc_oi,'pc_vol':None,'max_pain':mp,'mp_dist':mp_dist,'levels':levels,
         })
         total_c += c_oi; total_p += p_oi
-
     if not expiries_out:
         print("    ✗ BTC Deribit: sin expiries procesados"); return None
-
     agg_pc = round(total_p/total_c,2) if total_c > 0 else None
     print(f"    ✓ BTC Deribit  {len(expiries_out)} vencimientos  P/C={agg_pc}  (OI en contratos BTC)")
     return {
@@ -879,38 +812,31 @@ def _load_btc_options_deribit():
         'total_call_oi_all': total_c, 'total_put_oi_all': total_p,
         'agg_pc': agg_pc, 'source': 'deribit', 'oi_unit': 'contratos BTC',
     }
-
 def load_options_data():
     """Fetch options for SPY, BTC (Deribit), SLV, GGAL."""
     print(f"\n[{time.strftime('%H:%M:%S')}] Cargando datos de opciones...")
     result = {}
-
     # yfinance tickers
     for sym, label in OPTIONS_YF_TICKERS.items():
         print(f"  → {sym}")
         data = _load_yf_options(sym, label, n_exp=5)
         if data: result[sym] = data
         time.sleep(1.5)
-
     # BTC via Deribit
     print(f"  → BTC (Deribit)")
     btc_data = _load_btc_options_deribit()
     if btc_data: result['BTC'] = btc_data
-
     with _lock:
         _options['data']       = result
         _options['updated_at'] = time.strftime("%d/%m/%Y  %H:%M:%S")
     print(f"[{time.strftime('%H:%M:%S')}] Opciones listas ✓  ({list(result.keys())})")
-
 def options_loop():
     while True:
-        time.sleep(900)
-        gc.collect()
+        time.sleep(900)   # refresh cada 15 min
         try:
             load_options_data()
         except Exception as e:
             print(f"[options_loop] Error: {e}")
-
 # ── technical helpers ─────────────────────────────────────────────────────────
 def _rsi(series, period=14):
     delta = series.diff()
@@ -920,7 +846,6 @@ def _rsi(series, period=14):
     avg_l = loss.ewm(com=period-1, min_periods=period).mean()
     rs    = avg_g / avg_l.replace(0, float('inf'))
     return (100 - (100 / (1 + rs))).iloc[-1]
-
 def load_technicals():
     for ticker in ALL_TICKERS:
         try:
@@ -931,22 +856,18 @@ def load_technicals():
                 continue
             close_d = hist_d['Close']
             price   = float(close_d.iloc[-1])
-
             rsi_d  = round(float(_rsi(close_d)), 1)
             rsi_w  = round(float(_rsi(hist_w['Close'])), 1) if len(hist_w) >= 15 else None
             ema200 = float(close_d.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close_d) >= 100 else None
             ema50  = float(close_d.ewm(span=50,  adjust=False).mean().iloc[-1]) if len(close_d) >= 30  else None
             pct_e200 = round(((price - ema200) / ema200) * 100, 1) if ema200 else None
-
             ema12   = close_d.ewm(span=12, adjust=False).mean()
             ema26   = close_d.ewm(span=26, adjust=False).mean()
             macd_l  = ema12 - ema26
             sig_l   = macd_l.ewm(span=9, adjust=False).mean()
             macd_bull = bool(macd_l.iloc[-1] > sig_l.iloc[-1])
             macd_hist = round(float(macd_l.iloc[-1] - sig_l.iloc[-1]), 2)
-
             golden = bool(ema50 and ema200 and ema50 > ema200)
-
             # ATR 14
             atr14 = None
             if len(hist_d) >= 15:
@@ -955,7 +876,6 @@ def load_technicals():
                 pc   = close_d.shift(1)
                 tr   = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
                 atr14 = round(float(tr.ewm(span=14, adjust=False).mean().iloc[-1]), 2)
-
             # composite tech signal: count bullish vs bearish factors
             bulls = sum([
                 rsi_d < 70,                     # not overbought daily
@@ -974,7 +894,6 @@ def load_technicals():
             if bulls >= 4:    signal = 'buy'
             elif bears >= 4:  signal = 'sell'
             else:             signal = 'neutral'
-
             with _lock:
                 _tech[ticker] = {
                     'rsi_d':    rsi_d,
@@ -992,17 +911,14 @@ def load_technicals():
             time.sleep(0.3)
         except Exception as e:
             print(f"  ✗ tech {ticker}: {e}")
-
 def technicals_loop():
     while True:
         time.sleep(900)
-        gc.collect()
         try:
             print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando indicadores técnicos...")
             load_technicals()
         except Exception as e:
             print(f"[technicals_loop] Error: {e}")
-
 def load_sparklines():
     for ticker in ALL_TICKERS:
         try:
@@ -1014,34 +930,28 @@ def load_sparklines():
             time.sleep(0.2)
         except Exception as e:
             print(f"  ✗ spark {ticker}: {e}")
-
 def sparklines_loop():
     while True:
-        time.sleep(1800)
-        gc.collect()
+        time.sleep(1800)   # refresh cada 30 min
         try:
             print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando sparklines...")
             load_sparklines()
         except Exception as e:
             print(f"[sparklines_loop] Error: {e}")
-
 def safe(d, *keys, default=None):
     for k in keys:
         if isinstance(d, dict): d = d.get(k)
         else: return default
     return d if d is not None else default
-
 def load_fundamentals():
     for ticker in ALL_TICKERS:
         try:
             t    = yf.Ticker(ticker)
             info = t.info or {}
-
             price      = info.get('currentPrice') or info.get('regularMarketPrice')
             prev_close = info.get('previousClose') or info.get('regularMarketPreviousClose')
             mktcap     = info.get('marketCap') or 0
             mktcap_b   = round(mktcap / 1e9, 1) if mktcap else None
-
             # analyst score: yfinance recommendationMean 1=Strong Buy … 5=Strong Sell
             analyst_score = None
             analyst_buy = analyst_hold = analyst_sell = None
@@ -1066,23 +976,13 @@ def load_fundamentals():
                         if not analyst_score:
                             analyst_score = round((sb*5+b*4+h*3+sl*2+ss*1)/total, 2)
             except Exception: pass
-
             # price target
             price_target = None
             try:
                 pt = info.get('targetMedianPrice') or info.get('targetMeanPrice')
                 if pt: price_target = round(float(pt), 2)
             except Exception: pass
-
-            # fallback: use Finnhub only for price_target if yf didn't have it
-            if not price_target:
-                try:
-                    ft = fc.price_target(symbol=ticker)
-                    v  = ft.get('targetMedian') or ft.get('targetMean')
-                    if v: price_target = round(float(v), 2)
-                    time.sleep(1.0)   # 1 Finnhub call, safe within rate limit
-                except Exception: pass
-
+            # price_target ya viene de yfinance info — no hay fallback externo necesario
             # RVOL — relative volume vs 20-day avg, adjusted by time of day
             avg_vol = info.get('averageVolume') or info.get('averageDailyVolume10Day') or 0
             cur_vol = info.get('volume') or 0
@@ -1101,7 +1001,6 @@ def load_fundamentals():
                         rvol = round(cur_vol / avg_vol, 2)
                 except Exception:
                     rvol = round(cur_vol / avg_vol, 2) if avg_vol else None
-
             with _lock:
                 _info[ticker] = {
                     'name':         (info.get('longName') or info.get('shortName') or ticker)[:34],
@@ -1149,63 +1048,63 @@ def load_fundamentals():
             time.sleep(0.4)
         except Exception as e:
             print(f"  ✗ {ticker}: {e}")
-
 def fundamentals_loop():
     while True:
         time.sleep(FUND_REFRESH_S)
-        gc.collect()
         try:
-            import resource
-            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-            print(f"  [MEM] {mem_mb:.0f} MB")
-        except: pass
-        print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando fundamentals...")
-        load_fundamentals()
-
-def on_message(ws_app, message):
-    try:
-        data = json.loads(message)
-        if data.get('type') == 'trade':
-            for trade in data.get('data', []):
-                sym = trade.get('s','')
-                price = trade.get('p')
-                if sym and price and sym in ALL_TICKERS:
-                    with _lock:
-                        prev = _prices.get(sym,{}).get('prev_close')
-                        chg  = round(price-prev,2) if prev else None
-                        chgp = round((chg/prev)*100,2) if chg and prev else None
-                        _prices[sym] = {**_prices.get(sym,{}),
-                            'price':round(price,2),'change':chg,
-                            'changepct':chgp,'source':'live'}
-    except Exception as e: print(f"WS: {e}")
-
-def on_error(ws_app,e): print(f"WS error: {e}")
-def on_close(ws_app,c,m):
-    # FIX: no llamar start_ws() aquí — causaría stack overflow por recursión infinita
-    print(f"[{time.strftime('%H:%M:%S')}] WS cerrado. Loop de reconexión retomará en 5s.")
-def on_open(ws_app):
-    print(f"[{time.strftime('%H:%M:%S')}] WS conectado, suscribiendo {len(ALL_TICKERS)} tickers...")
-    for sym in ALL_TICKERS:
-        ws_app.send(json.dumps({"type":"subscribe","symbol":sym}))
-    print("Suscripciones activas ✓")
-
-def start_ws():
-    """Loop de reconexión — nunca retorna. Reconecta con backoff exponencial."""
+            print(f"\n[{time.strftime('%H:%M:%S')}] Refrescando fundamentals...")
+            load_fundamentals()
+        except Exception as e:
+            print(f"[fundamentals_loop] Error: {e}")
+def price_poll_loop():
+    """Polling de precios via yfinance — batch único cada PRICE_POLL_S segundos.
+    Sin WebSocket, sin API keys externas, sin desconexiones."""
     _delay = 5
     while True:
         try:
-            print(f"[{time.strftime('%H:%M:%S')}] Iniciando WebSocket Finnhub...")
-            ws_app = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={API_KEY}",
-                on_message=on_message,on_error=on_error,on_close=on_close,on_open=on_open)
-            ws_app.run_forever(ping_interval=30,ping_timeout=10)
+            print(f"[{time.strftime('%H:%M:%S')}] Actualizando precios ({len(ALL_TICKERS)} tickers)...")
+            raw = yf.download(
+                tickers=ALL_TICKERS,
+                period='1d',
+                interval='1m',
+                progress=False,
+                group_by='ticker',
+                auto_adjust=True,
+                threads=True,
+            )
+            updated = 0
+            for sym in ALL_TICKERS:
+                try:
+                    if len(ALL_TICKERS) == 1:
+                        close_series = raw['Close']
+                    else:
+                        close_series = raw[sym]['Close']
+                    last_valid = close_series.dropna()
+                    if last_valid.empty:
+                        continue
+                    price = round(float(last_valid.iloc[-1]), 2)
+                    with _lock:
+                        prev = _prices.get(sym, {}).get('prev_close')
+                        chg  = round(price - prev, 2) if prev else None
+                        chgp = round((chg / prev) * 100, 2) if chg and prev else None
+                        existing = _prices.get(sym, {})
+                        _prices[sym] = {
+                            **existing,
+                            'price':     price,
+                            'change':    chg,
+                            'changepct': chgp,
+                            'source':    'yf-poll',
+                        }
+                    updated += 1
+                except Exception:
+                    pass
+            print(f"  ✓ {updated}/{len(ALL_TICKERS)} precios actualizados")
+            _delay = PRICE_POLL_S  # reset delay al éxito
         except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] WS excepción: {e}")
-        print(f"[{time.strftime('%H:%M:%S')}] WS desconectado. Reconectando en {_delay:.0f}s...")
+            print(f"[price_poll_loop] Error: {e}")
+            _delay = min(_delay * 1.5, 120)
         time.sleep(_delay)
-        _delay = min(_delay * 1.5, 60)
-
 app = Flask(__name__)
-
 @app.route('/api/stocks')
 def api_stocks():
     with _lock:
@@ -1270,58 +1169,63 @@ def api_stocks():
                 'sparkline':     _sparklines.get(ticker, []),
             })
     return jsonify({'data':result,'updated_at':time.strftime("%d/%m/%Y  %H:%M:%S")})
-
 @app.route('/api/market')
 def api_market():
     with _lock:
         return jsonify(dict(_market))
-
 @app.route('/api/mining')
 def api_mining():
     with _lock:
         return jsonify(dict(_mining))
-
 @app.route('/api/options')
 def api_options():
     with _lock:
         return jsonify(dict(_options))
-
 @app.route('/api/news/<ticker>')
 def api_news(ticker):
     if ticker not in ALL_TICKERS:
         return jsonify({'error':'ticker no válido'})
     try:
-        now  = datetime.now()
-        news = fc.company_news(ticker,
-            _from=(now - timedelta(days=7)).strftime('%Y-%m-%d'),
-            to=now.strftime('%Y-%m-%d'))
-        result = []
-        for n in (news or [])[:10]:
-            ts = n.get('datetime',0)
+        now      = datetime.now()
+        t        = yf.Ticker(ticker)
+        news_raw = t.news or []
+        result   = []
+        for n in news_raw[:10]:
+            ct  = n.get('content') or {}
+            ts  = ct.get('pubDate') or ''
+            # Intentar parsear la fecha ISO
+            ago = '—'
             try:
-                dt = datetime.fromtimestamp(ts)
-                diff = now - dt
-                if diff.days > 0:    ago = f"hace {diff.days}d"
-                elif diff.seconds > 3600: ago = f"hace {diff.seconds//3600}h"
-                else:                ago = f"hace {diff.seconds//60}m"
+                if ts:
+                    dt   = datetime.fromisoformat(ts.replace('Z','+00:00')).replace(tzinfo=None)
+                    diff = now - dt
+                    if diff.days > 0:             ago = f"hace {diff.days}d"
+                    elif diff.seconds > 3600:     ago = f"hace {diff.seconds//3600}h"
+                    else:                         ago = f"hace {diff.seconds//60}m"
             except Exception:
-                ago = '—'
+                pass
+            # Obtener imagen de thumbnail si existe
+            thumb = ''
+            try:
+                thumbs = ct.get('thumbnail', {}).get('resolutions', [])
+                if thumbs:
+                    thumb = thumbs[0].get('url', '')
+            except Exception:
+                pass
             result.append({
-                'headline': n.get('headline',''),
-                'source':   n.get('source',''),
-                'url':      n.get('url','#'),
-                'image':    n.get('image',''),
-                'summary':  (n.get('summary','') or '')[:220],
+                'headline': ct.get('title') or n.get('title',''),
+                'source':   (ct.get('provider') or {}).get('displayName','Yahoo Finance'),
+                'url':      ct.get('canonicalUrl',{}).get('url') or n.get('link','#'),
+                'image':    thumb,
+                'summary':  (ct.get('summary') or ct.get('description') or '')[:220],
                 'ago':      ago,
             })
         return jsonify({'ticker':ticker,'news':result})
     except Exception as e:
         return jsonify({'error':str(e),'news':[]})
-
 @app.route('/')
 def index():
     return render_template_string(HTML, poll=POLL_MS)
-
 HTML = r"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1331,14 +1235,12 @@ HTML = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a1520;color:#dce8f0;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh}
-
 /* header */
 header{background:linear-gradient(135deg,#142030,#0a1520);padding:13px 20px;
   border-bottom:2px solid #1e3a56;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
 h1{font-size:1.28rem;color:#f0c040;font-weight:700;letter-spacing:.3px}
 h1 span{color:#6a9aba;font-size:.82rem;font-weight:400;margin-left:10px}
 #meta{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-
 /* badges */
 .badge{border-radius:10px;padding:3px 10px;font-size:.72rem;font-weight:700;letter-spacing:.4px}
 .mkt-open {background:#0a2a18;color:#2ecc71;border:1px solid #1a5a30}
@@ -1347,7 +1249,6 @@ h1 span{color:#6a9aba;font-size:.82rem;font-weight:400;margin-left:10px}
 .mkt-closed{background:#141420;color:#506070;border:1px solid #202030}
 .live-badge{background:#0a2218;color:#2ecc71;border:1px solid #1a5228;border-radius:10px;padding:3px 10px;font-size:.72rem;font-weight:700}
 #updated{font-size:.75rem;color:#405060}
-
 /* toolbar */
 .toolbar{display:flex;gap:8px;padding:9px 18px;background:#0d1a28;border-bottom:1px solid #162636;align-items:center;flex-wrap:wrap}
 #search{background:#0a1520;border:1px solid #1e3a56;color:#dce8f0;border-radius:6px;padding:5px 11px;font-size:.8rem;width:200px;outline:none}
@@ -1357,14 +1258,12 @@ h1 span{color:#6a9aba;font-size:.82rem;font-weight:400;margin-left:10px}
 .fbtn:hover,.fbtn.active{background:#142a42;color:#dce8f0;border-color:#2a6aaa}
 .alert-ctrl{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:.75rem;color:#405060}
 .alert-ctrl input{width:50px;background:#0a1520;border:1px solid #1e3a56;color:#dce8f0;border-radius:4px;padding:3px 6px;font-size:.76rem;text-align:center}
-
 /* tabs */
 .tabs{display:flex;gap:0;padding:0 18px;background:#0c1825;border-bottom:2px solid #162636}
 .tab{padding:9px 18px;font-size:.8rem;font-weight:600;color:#405878;cursor:pointer;
   border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s;letter-spacing:.3px}
 .tab:hover{color:#8abada}
 .tab.active{color:#f0c040;border-bottom-color:#f0c040}
-
 /* top pick */
 .pick{display:inline-flex;align-items:center;justify-content:center;
   width:18px;height:18px;border-radius:50%;background:#0a2248;
@@ -1373,14 +1272,12 @@ h1 span{color:#6a9aba;font-size:.82rem;font-weight:400;margin-left:10px}
 .pick-row td:nth-child(1){background:#0a1e36 !important}
 .score-pill{display:inline-block;background:#0a1e36;color:#4a9eff;border:1px solid #1a3a6a;
   border-radius:8px;padding:1px 7px;font-size:.7rem;font-weight:700}
-
 /* legend */
 .legend{display:flex;gap:14px;padding:5px 18px;background:#0a1520;font-size:.7rem;
   color:#304050;flex-wrap:wrap;align-items:center;border-bottom:1px solid #0e1e2e}
 .leg-item{display:flex;align-items:center;gap:5px}
 .leg-dot{width:8px;height:8px;border-radius:2px}
 .leg-right{margin-left:auto;font-size:.67rem;color:#1e3040}
-
 /* table */
 .section-title{padding:9px 18px 3px;font-size:.68rem;font-weight:700;
   letter-spacing:2px;text-transform:uppercase;color:#4a7890}
@@ -1394,7 +1291,6 @@ thead th:hover{color:#a8cce8}
 thead th.sort-asc::after{content:' ▲';color:#f0c040;font-size:.62rem}
 thead th.sort-desc::after{content:' ▼';color:#f0c040;font-size:.62rem}
 thead th.no-sort{cursor:default}
-
 tbody tr{border-bottom:1px solid #0e1e2a;transition:background .1s}
 tbody tr:hover{background:#10202e}
 tbody tr.req  td:first-child{border-left:3px solid #2a6aaa}
@@ -1402,10 +1298,8 @@ tbody tr.rec  td:first-child{border-left:3px solid #20a060}
 tbody tr.ai   td:first-child{border-left:3px solid #9040c0}
 tbody tr.alert-hi{background:#082018 !important}
 tbody tr.alert-lo{background:#200808 !important}
-
 td{padding:6px 9px;text-align:right;vertical-align:middle;white-space:nowrap}
 td.left{text-align:left}
-
 .ticker{font-weight:700;color:#60c0e0;font-size:.84rem}
 .tname{color:#607888;font-size:.72rem;max-width:170px;overflow:hidden;text-overflow:ellipsis;display:block}
 .price{font-weight:700;color:#dce8f0;font-size:.88rem}
@@ -1414,40 +1308,33 @@ td.left{text-align:left}
 .pos-bg{background:#0a2010;color:#2ecc71;border-radius:3px;padding:0 4px}
 .neg-bg{background:#200808;color:#e74c3c;border-radius:3px;padding:0 4px}
 .na{color:#203040}
-
 /* sector tag */
 .stag{display:inline-block;background:#101e2e;color:#507090;border-radius:3px;
   padding:1px 5px;font-size:.66rem;border:1px solid #1a2e40;max-width:130px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
 /* analyst bar */
 .abar{display:flex;height:6px;border-radius:3px;overflow:hidden;min-width:60px;gap:1px}
 .abar-buy{background:#2ecc71}.abar-hold{background:#f0c040}.abar-sell{background:#e74c3c}
 .ascore{font-weight:700;font-size:.8rem;margin-right:5px}
 .score-5{color:#2ecc71}.score-4{color:#90d050}.score-3{color:#f0c040}
 .score-2{color:#e09040}.score-1{color:#e74c3c}
-
 /* source dots */
 .src-live{display:inline-block;width:6px;height:6px;border-radius:50%;
   background:#2ecc71;animation:blink 1.8s infinite;margin-right:3px}
 .src-rest{display:inline-block;width:6px;height:6px;border-radius:50%;
   background:#2a5aaa;margin-right:3px}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.1}}
-
 .flash-up{animation:fup .5s ease}
 .flash-dn{animation:fdn .5s ease}
 @keyframes fup{0%{background:#082818}100%{background:transparent}}
 @keyframes fdn{0%{background:#280808}100%{background:transparent}}
-
 footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-top:1px solid #0e1e2e;margin-top:4px}
 ::-webkit-scrollbar{height:4px;width:4px}
 ::-webkit-scrollbar-track{background:#0a1520}
 ::-webkit-scrollbar-thumb{background:#1e3a56;border-radius:3px}
-
 /* sparklines */
 .spark{display:inline-block;vertical-align:middle;cursor:pointer}
 .spark:hover{opacity:.75}
-
 /* news panel */
 #news-panel{position:fixed;top:0;right:-440px;width:420px;height:100vh;
   background:#0c1825;border-left:2px solid #1e3a56;z-index:1000;
@@ -1475,7 +1362,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .news-loading{text-align:center;padding:40px;color:#304050;font-size:.85rem}
 #news-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;display:none}
 #news-overlay.open{display:block}
-
 /* technical indicators */
 .rsi-ob  {background:#2a0a0a;color:#e74c3c;border:1px solid #5a1a1a;border-radius:5px;padding:1px 7px;font-weight:700;font-size:.75rem}
 .rsi-os  {background:#0a2a10;color:#2ecc71;border:1px solid #1a5a20;border-radius:5px;padding:1px 7px;font-weight:700;font-size:.75rem}
@@ -1490,7 +1376,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .sig-buy    {background:#0a2818;color:#2ecc71;border:1px solid #1a5828;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 .sig-sell   {background:#280a0a;color:#e74c3c;border:1px solid #581a1a;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
 .sig-neutral{background:#101e2e;color:#7a9aba;border:1px solid #1e3040;border-radius:6px;padding:2px 9px;font-weight:700;font-size:.76rem;letter-spacing:.5px}
-
 /* ── Opciones ────────────────────────────────────────────────────── */
 .opt-wrap{padding:10px 18px 28px}
 .opt-ticker-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:6px}
@@ -1528,7 +1413,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .opt-insight b{color:#608090}
 .oi-bar-cell{min-width:80px}
 .oi-mini{display:inline-block;height:8px;border-radius:2px;vertical-align:middle;margin-right:3px}
-
 /* ── Materias Primas ─────────────────────────────────────────────── */
 .mining-wrap{padding:10px 18px 24px}
 .mining-section{margin-bottom:18px}
@@ -1558,7 +1442,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .rsi-mid{color:#a0b8c8}
 .d-neg{color:#e74c3c}.d-pos{color:#2ecc71}.d-neu{color:#7a9aba}
 .vol-fmt{color:#405060;font-size:.72rem}
-
 /* ── Resumen Diario ─────────────────────────────────────────────── */
 .mkt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;padding:16px 18px}
 .mkt-card{background:#0d1a28;border:1px solid #162636;border-radius:8px;padding:14px 16px}
@@ -1595,13 +1478,11 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .news-mkt-hl:hover{color:#f0c040}
 .news-mkt-meta{font-size:.67rem;color:#304050}
 .mkt-loading{text-align:center;padding:60px;color:#304050;font-size:.9rem}
-
 /* RVOL */
 .rvol-hot  {background:#2a1a00;color:#f0a030;border:1px solid #5a3a00;border-radius:4px;padding:1px 6px;font-weight:700;font-size:.74rem}
 .rvol-high {background:#1a2a00;color:#90d050;border:1px solid #3a5a00;border-radius:4px;padding:1px 6px;font-weight:700;font-size:.74rem}
 .rvol-norm {background:#101e2e;color:#608090;border:1px solid #1e3040;border-radius:4px;padding:1px 6px;font-size:.74rem}
 .rvol-low  {color:#304050;font-size:.74rem}
-
 /* Fear & Greed */
 .fg-meter{display:flex;flex-direction:column;align-items:center;padding:8px 0}
 .fg-score{font-size:2.8rem;font-weight:900;line-height:1}
@@ -1611,14 +1492,12 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .fg-greed{color:#2ecc71}.fg-fgreed{color:#90d050}
 .fg-neutral{color:#f0c040}
 .fg-fear{color:#e09040}.fg-xfear{color:#e74c3c}
-
 /* Sector heatmap */
 .sector-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px}
 .sector-cell{border-radius:6px;padding:8px 10px;text-align:center}
 .sector-name{font-size:.67rem;color:rgba(255,255,255,.6);margin-bottom:3px}
 .sector-sym{font-size:.7rem;font-weight:700;color:rgba(255,255,255,.4);margin-bottom:2px}
 .sector-chg{font-size:.88rem;font-weight:700}
-
 /* Economic Calendar */
 .cal-row{display:grid;grid-template-columns:75px 1fr 55px 65px 65px;gap:6px;
   align-items:center;padding:6px 0;border-bottom:1px solid #0e1e2e;font-size:.75rem}
@@ -1630,7 +1509,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .cal-imp-low{color:#405060;font-size:.68rem}
 .cal-val{text-align:right;font-size:.72rem}
 .cal-act{color:#2ecc71;font-weight:700}
-
 /* Earnings */
 .earn-row{display:grid;grid-template-columns:55px 75px 45px 85px 85px;gap:6px;
   align-items:center;padding:5px 0;border-bottom:1px solid #0e1e2e;font-size:.74rem}
@@ -1641,13 +1519,11 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 .earn-bmo{background:#0a1e36;color:#4a9eff}
 .earn-amc{background:#1a0a2e;color:#9060e0}
 .earn-dmh{background:#101e2e;color:#607080}
-
 /* Pre-market movers */
 .pre-row{display:flex;justify-content:space-between;align-items:center;
   padding:4px 0;border-bottom:1px solid #0e1e2a;font-size:.76rem}
 .pre-row:last-child{border-bottom:none}
 .pre-ticker{font-weight:700;color:#60c0e0;min-width:50px}
-
 /* Breadth */
 .breadth-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .breadth-item{background:#0a1520;border-radius:6px;padding:8px 10px;text-align:center}
@@ -1656,16 +1532,14 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
 </style>
 </head>
 <body>
-
 <header>
-  <h1>🇺🇸 USA Stock Tracker <span>Finnhub Real-Time</span></h1>
+  <h1>🇺🇸 USA Stock Tracker <span>yfinance · c/30s</span></h1>
   <div id="meta">
     <div id="mkt-status" class="badge mkt-closed">● CERRADO</div>
     <div id="live-count" class="live-badge" style="display:none"></div>
     <div id="updated">Conectando...</div>
   </div>
 </header>
-
 <div class="toolbar">
   <input id="search" type="text" placeholder="🔍 Buscar ticker o empresa..." oninput="renderAll()">
   <div style="display:flex;gap:5px">
@@ -1676,7 +1550,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   </div>
   <div class="alert-ctrl">⚡ Alerta &gt; <input id="thr" type="number" value="3" min="0.5" max="20" step="0.5"> %</div>
 </div>
-
 <div class="tabs">
   <div class="tab active" onclick="setTab('prices',this)">💰 Precios</div>
   <div class="tab" onclick="setTab('valuation',this)">📊 Valuación</div>
@@ -1687,7 +1560,6 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   <div class="tab" onclick="setTab('mining',this)">⛏️ Materias Primas</div>
   <div class="tab" onclick="setTab('options',this)">📋 Opciones</div>
 </div>
-
 <div class="legend">
   <div class="leg-item"><div class="leg-dot" style="background:#2a6aaa"></div>Solicitadas</div>
   <div class="leg-item"><div class="leg-dot" style="background:#20a060"></div>Recomendadas</div>
@@ -1695,12 +1567,10 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   <div class="leg-item"><span class="src-live"></span>Vivo (WS)</div>
   <div class="leg-item"><span class="src-rest"></span>REST</div>
   <div class="leg-item"><span class="pick" style="cursor:default">✦</span>&nbsp;Top Pick — mejor combinación de crecimiento + valuación según analistas</div>
-  <div class="leg-right">Click en columna para ordenar · Actualización cada 3s · Finnhub.io</div>
+  <div class="leg-right">Click en columna para ordenar · Actualización cada 30s · yfinance</div>
 </div>
-
 <div id="root"><div style="text-align:center;padding:60px;color:#304050">⏳ Cargando...</div></div>
-<footer>Datos de Finnhub.io · yfinance. Fuera de horario de mercado los precios son del último cierre. No constituye consejo de inversión.</footer>
-
+<footer>Datos de Yahoo Finance vía yfinance · Actualización cada 30s. Fuera de horario de mercado los precios son del último cierre. No constituye consejo de inversión.</footer>
 <!-- news panel -->
 <div id="news-overlay" onclick="closeNews()"></div>
 <div id="news-panel">
@@ -1713,11 +1583,9 @@ footer{padding:8px 18px;text-align:center;color:#1e3040;font-size:.68rem;border-
   </div>
   <div id="news-list"><div class="news-loading">Seleccioná un ticker para ver noticias</div></div>
 </div>
-
 <script>
 const POLL = {{ poll }};
 let allData=[], sortCol=null, sortDir=1, activeGroup='all', activeTab='prices', prevPrices={};
-
 /* ── market status ── */
 function mktStatus(){
   const et=new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));
@@ -1730,7 +1598,6 @@ function mktStatus(){
 }
 function updateMkt(){const{cls,lbl}=mktStatus();const el=document.getElementById('mkt-status');el.textContent=lbl;el.className='badge '+cls;}
 updateMkt(); setInterval(updateMkt,30000);
-
 /* ── helpers ── */
 function f(v,dec=2,pre='',suf=''){
   if(v==null||isNaN(v))return'<span class="na">—</span>';
@@ -1756,7 +1623,6 @@ function fVol(v){
 function cls(v){return v==null?'neu':v>=0?'pos':'neg';}
 function arr(v){return v==null?'':v>=0?'▲ ':'▼ ';}
 function src(s){return s==='live'?'<span class="src-live"></span>':'<span class="src-rest"></span>';}
-
 /* ── analyst score ── */
 function analystScore(s){
   if(s==null)return'<span class="na">—</span>';
@@ -1777,7 +1643,6 @@ function analystBar(buy,hold,sell){
     <small style="color:#405060;font-size:.67rem">${buy}/${hold}/${sell}</small>
   </div>`;
 }
-
 /* ── technical helpers ── */
 function rsiCell(v){
   if(v==null) return '<span class="na">—</span>';
@@ -1815,7 +1680,6 @@ function sigCell(sig){
   if(sig==='sell')    return'<span class="sig-sell">▼ EVITAR</span>';
   return'<span class="sig-neutral">— NEUTRAL</span>';
 }
-
 /* ── RVOL cell ── */
 function rvolCell(v){
   if(v==null) return '<span class="na">—</span>';
@@ -1825,12 +1689,10 @@ function rvolCell(v){
   if(v>=0.8) return`<span class="rvol-norm">${rv}</span>`;
   return`<span class="rvol-low">${rv}</span>`;
 }
-
 /* ── top pick scoring ── */
 function computeScore(s){
   // Each component normalized 0–10
   let total=0, weight=0;
-
   // 1. Analyst consensus (40% weight) — score 1–5 → 0–10
   if(s.analyst_score!=null){
     total += ((s.analyst_score-1)/4)*10 * 4;
@@ -1857,11 +1719,9 @@ function computeScore(s){
     total += Math.min(Math.max((3-peg)/3,0),1)*10 * 0.5;
     weight += 0.5;
   }
-
   if(weight===0) return null;
   return Math.round((total/weight)*10)/10;
 }
-
 function markTopPicks(data){
   const scored = data.map(s=>({...s, _score: computeScore(s)}))
                      .filter(s=>s._score!=null);
@@ -1875,7 +1735,6 @@ function markTopPicks(data){
     _pick:  picks.has(s.ticker),
   }));
 }
-
 function pickCell(s){
   if(!s._pick) return '<td></td>';
   const reasons=[];
@@ -1887,7 +1746,6 @@ function pickCell(s){
   const tip = reasons.join(' · ');
   return`<td><span class="pick" title="${tip}">✦</span></td>`;
 }
-
 /* ── tab columns ── */
 const TABS = {
   prices: [
@@ -1987,7 +1845,6 @@ const TABS = {
     {h:'Sector',  sk:'sector',    r:(s)=>`<span class="stag">${s.sector||'—'}</span>`},
   ],
 };
-
 /* ── state ── */
 function setGroup(g,btn){
   activeGroup=g;
@@ -2007,7 +1864,6 @@ function sortBy(k){
   if(sortCol===k)sortDir*=-1; else{sortCol=k;sortDir=1;}
   renderAll();
 }
-
 /* ── filter + sort ── */
 function visible(){
   const q=document.getElementById('search').value.toLowerCase();
@@ -2026,7 +1882,6 @@ function visible(){
   }
   return{rows,thr};
 }
-
 /* ── render ── */
 function buildSection(title,rows,cols,thr){
   if(!rows.length)return'';
@@ -2056,7 +1911,6 @@ function buildSection(title,rows,cols,thr){
 <tbody>${trs}</tbody>
 </table></div>`;
 }
-
 function renderAll(){
   const{rows,thr}=visible();
   const cols=TABS[activeTab];
@@ -2075,7 +1929,6 @@ function renderAll(){
   if(!rows.length)html='<div style="text-align:center;padding:40px;color:#304050">Sin resultados.</div>';
   document.getElementById('root').innerHTML=html;
 }
-
 /* ── sparkline ── */
 function sparklineSVG(prices, w=90, h=30){
   if(!prices||prices.length<3) return '<span class="na" style="font-size:.65rem">sin datos</span>';
@@ -2102,7 +1955,6 @@ function sparklineSVG(prices, w=90, h=30){
     </svg>
   </span>`;
 }
-
 /* ── news panel ── */
 let newsOpen=false;
 async function openNews(ticker, name){
@@ -2138,23 +1990,19 @@ function closeNews(){
   document.getElementById('news-overlay').classList.remove('open');
   newsOpen=false;
 }
-
 /* ── Market Summary helpers ── */
 let mktData = null;
-
 function biasChip(b){
   if(b==='long')    return '<span class="bias-long">▲ LONG</span>';
   if(b==='short')   return '<span class="bias-short">▼ SHORT</span>';
   return '<span class="bias-neutral">— NEUTRAL</span>';
 }
-
 function fInst(v, sym){
   // For yields and DXY omit $ sign
   const noSign = ['vix','us10y','us30y','dxy'].includes(sym);
   if(v==null) return '<span class="na">—</span>';
   return noSign ? v.toFixed(2) : '$'+v.toFixed(2);
 }
-
 function pivotHtml(pivots, label){
   if(!pivots) return '<span class="na" style="font-size:.72rem">Sin datos</span>';
   return `<div style="margin-top:4px">
@@ -2169,7 +2017,6 @@ function pivotHtml(pivots, label){
     </div>
   </div>`;
 }
-
 function formatMktTime(ts){
   if(!ts) return '';
   // accepts Unix timestamp (number) or ISO string
@@ -2181,7 +2028,6 @@ function formatMktTime(ts){
   if(diff < 86400) return `hace ${Math.round(diff/3600)}h`;
   return d.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit'});
 }
-
 async function renderMarket(){
   document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Cargando resumen de mercado...</div>';
   try{
@@ -2196,7 +2042,6 @@ async function renderMarket(){
     setTimeout(renderMarket, 8000);
     return;
   }
-
   const INST_META = {
     sp500:{label:'S&P 500', name:'SPDR S&P 500'},
     qqq:  {label:'QQQ',     name:'Invesco QQQ (Nasdaq 100)'},
@@ -2207,7 +2052,6 @@ async function renderMarket(){
     gold: {label:'Gold',    name:'Oro ($/oz)'},
     oil:  {label:'WTI',     name:'Petróleo Crudo WTI'},
   };
-
   // ── 1. Macro ──────────────────────────────────────────────────────────────
   let macroRows='';
   for(const [key,meta] of Object.entries(INST_META)){
@@ -2223,7 +2067,6 @@ async function renderMarket(){
       <span class="mkt-inst-chg ${cc}">${d.chgp>=0?'+':''}${d.chgp.toFixed(2)}%</span>
     </div>`;
   }
-
   // ── 2. Fear & Greed ───────────────────────────────────────────────────────
   const FG_LABELS = {
     'extreme greed':'CODICIA EXTREMA','greed':'CODICIA',
@@ -2253,7 +2096,6 @@ async function renderMarket(){
       </div>
     </div>`;
   }
-
   // ── 3. Bias + Pivots ──────────────────────────────────────────────────────
   const sp=mktData.sp500||{}, qq=mktData.qqq||{};
   const biasHtml=`
@@ -2266,12 +2108,10 @@ async function renderMarket(){
       <span class="bias-label" style="margin-left:8px">Diario</span>${biasChip(qq.daily_bias)}
     </div>
     <div style="font-size:.62rem;color:#203040;margin-top:6px">EMA20/50 · RSI · MACD — no constituye consejo de inversión.</div>`;
-
   const pivotsHtml=`
     ${pivotHtml(sp.pivots,'S&P 500 — Floor Pivots')}
     <div style="margin-top:8px"></div>
     ${pivotHtml(qq.pivots,'QQQ — Floor Pivots')}`;
-
   // ── 4. Sector Heatmap ─────────────────────────────────────────────────────
   const sectors=mktData.sectors||[];
   let sectorHtml='<div class="sector-grid">';
@@ -2290,7 +2130,6 @@ async function renderMarket(){
   });
   sectorHtml+='</div>';
   if(!sectors.length) sectorHtml='<span class="na">Cargando sectores...</span>';
-
   // ── 5. Market Breadth ─────────────────────────────────────────────────────
   const br=mktData.breadth||{};
   const adRatio = (br.adv&&br.dec) ? (br.adv/(br.adv+br.dec)*100).toFixed(0) : null;
@@ -2317,7 +2156,6 @@ async function renderMarket(){
     TRIN (Arms Index): <strong>${br.trin.toFixed(2)}</strong>
     <span style="color:#304050"> (>1.5 presión vendedora · <0.5 compradora)</span>
   </div>`:''}`;
-
   // ── 6. Economic Calendar (mktnews) ───────────────────────────────────────
   const cal=mktData.econ_calendar||[];
   let calHtml='';
@@ -2352,7 +2190,6 @@ async function renderMarket(){
   } else {
     calHtml='<span class="na" style="font-size:.76rem">Cargando eventos económicos...</span>';
   }
-
   // ── 7. Earnings Calendar ──────────────────────────────────────────────────
   const earnings=mktData.earnings||[];
   let earnHtml='';
@@ -2374,7 +2211,6 @@ async function renderMarket(){
   } else {
     earnHtml='<span class="na" style="font-size:.76rem">Sin earnings próximos en tickers seguidos.</span>';
   }
-
   // ── 8. Pre-market movers ──────────────────────────────────────────────────
   const preMov=mktData.pre_movers||[];
   let preHtml='';
@@ -2402,7 +2238,6 @@ async function renderMarket(){
   } else {
     preHtml='<span class="na" style="font-size:.76rem">Sin movers pre-market significativos (&gt;1%).</span>';
   }
-
   // ── 9. Top movers ─────────────────────────────────────────────────────────
   const gainers=(mktData.top_gainers||[]).slice(0,15);
   const losers =(mktData.top_losers ||[]).slice(0,15);
@@ -2415,7 +2250,6 @@ async function renderMarket(){
     });
     return h+'</table>';
   };
-
   // ── 10. News (mktnews) ───────────────────────────────────────────────────
   const news=mktData.news||[];
   const impactColor={'bullish':'#2ecc71','bearish':'#e74c3c','mixed':'#f0c040'};
@@ -2444,7 +2278,6 @@ async function renderMarket(){
       </div>
     </div>`;
   }).join('') || '<span class="na">Cargando noticias...</span>';
-
   // ── Render ────────────────────────────────────────────────────────────────
   document.getElementById('root').innerHTML=`
   <div style="padding:6px 18px 0;font-size:.68rem;color:#1e3040;text-align:right">
@@ -2452,71 +2285,57 @@ async function renderMarket(){
     <span style="cursor:pointer;color:#2a6aaa" onclick="renderMarket()">↻ Refrescar</span>
   </div>
   <div class="mkt-grid">
-
     <div class="mkt-card" style="grid-column:span 2">
       <div class="mkt-card-title"><span>📊</span> ÍNDICES · TASAS · MACRO</div>
       ${macroRows}
     </div>
-
     <div class="mkt-card">
       <div class="mkt-card-title"><span>😱</span> FEAR &amp; GREED INDEX</div>
       ${fgHtml}
     </div>
-
     <div class="mkt-card">
       <div class="mkt-card-title"><span>🧭</span> BIAS TÉCNICO</div>
       ${biasHtml}
     </div>
-
     <div class="mkt-card" style="grid-column:span 2">
       <div class="mkt-card-title"><span>🌡️</span> HEATMAP DE SECTORES S&amp;P500</div>
       ${sectorHtml}
     </div>
-
     <div class="mkt-card">
       <div class="mkt-card-title"><span>📐</span> SOPORTES &amp; RESISTENCIAS</div>
       ${pivotsHtml}
       <div style="font-size:.62rem;color:#203040;margin-top:6px">Pivots clásicos Floor — OHLC sesión previa.</div>
     </div>
-
     <div class="mkt-card">
       <div class="mkt-card-title"><span>📡</span> AMPLITUD DE MERCADO</div>
       ${breadthHtml}
     </div>
-
     <div class="mkt-card" style="grid-column:span 2">
       <div class="mkt-card-title"><span>🌅</span> PRE-MARKET MOVERS</div>
       ${preHtml}
     </div>
-
     <div class="mkt-card">
       <div class="mkt-card-title"><span>🟢</span> TOP GAINERS S&amp;P500 (sesión previa)</div>
       ${moverTable(gainers,true)}
     </div>
-
     <div class="mkt-card">
       <div class="mkt-card-title"><span>🔴</span> TOP LOSERS S&amp;P500 (sesión previa)</div>
       ${moverTable(losers,false)}
     </div>
-
     <div class="mkt-card" style="grid-column:span 2">
       <div class="mkt-card-title"><span>📅</span> CALENDARIO ECONÓMICO — PRÓXIMOS 3 DÍAS (EE.UU.)</div>
       ${calHtml}
     </div>
-
     <div class="mkt-card" style="grid-column:span 2">
       <div class="mkt-card-title"><span>📢</span> EARNINGS — PRÓXIMAS 2 SEMANAS (TICKERS SEGUIDOS)</div>
       ${earnHtml}
     </div>
-
     <div class="mkt-card" style="grid-column:span 2">
       <div class="mkt-card-title"><span>📰</span> NOTICIAS DE MERCADO</div>
       ${newsHtml}
     </div>
-
   </div>`;
 }
-
 /* ── Materias Primas ── */
 const MINING_BADGE = {
   'gold':          ['ORO',     'gold'],
@@ -2536,7 +2355,6 @@ const MINING_GROUPS = [
   {label:'🔩 Mineras de Cobre & Uranio',       types:['copper-miner','uranium-miner']},
   {label:'🌏 Mineras Diversificadas',          types:['diversified']},
 ];
-
 function mRsi(v){
   if(v==null) return '<span class="na">—</span>';
   const cls = v>=70?'rsi-ob':v<=30?'rsi-os':'rsi-mid';
@@ -2566,7 +2384,6 @@ function mPrice(v){
   const dec = v>=100?2:v>=1?3:5;
   return `<span class="m-price">${v.toFixed(dec)}</span>`;
 }
-
 async function renderMining(){
   document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Cargando materias primas y mineras...</div>';
   let d;
@@ -2581,10 +2398,8 @@ async function renderMining(){
     document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Los datos se están calculando por primera vez (~90s)...</div>';
     setTimeout(renderMining,10000); return;
   }
-
   const byType={};
   d.forEach(r=>{ (byType[r.type]||(byType[r.type]=[])).push(r); });
-
   const tableHdr=`<table class="mining-table">
     <thead><tr>
       <th>Activo</th>
@@ -2598,7 +2413,6 @@ async function renderMining(){
       <th class="r">ATR% 14</th>
       <th class="r">Volumen</th>
     </tr></thead><tbody>`;
-
   let html='<div class="mining-wrap">';
   MINING_GROUPS.forEach(grp=>{
     const rows=grp.types.flatMap(t=>byType[t]||[]);
@@ -2642,7 +2456,6 @@ async function renderMining(){
   html+='</div>';
   document.getElementById('root').innerHTML=html;
 }
-
 /* ── Opciones ── */
 function pcChip(v){
   if(v==null) return '';
@@ -2661,7 +2474,6 @@ function fmtOI(v){
   if(v>=1e3) return (v/1e3).toFixed(0)+'K';
   return v.toString();
 }
-
 /* Flow score 0-1: last vs bid/ask midpoint.
    >0.65 → last near ask → COMPRADO (buyer initiated)
    <0.35 → last near bid → VENDIDO (seller initiated)
@@ -2691,7 +2503,6 @@ function moneybadge(m){
   const c=colors[m]||'#607080', bg=bgs[m]||'#0a1018';
   return `<span style="font-size:.58rem;padding:1px 4px;border-radius:3px;background:${bg};color:${c};border:1px solid ${c}30;font-weight:700;margin-left:3px">${m}</span>`;
 }
-
 function insightText(sym, price, expiries){
   if(!expiries||!expiries.length) return '';
   const first=expiries[0];
@@ -2708,26 +2519,22 @@ function insightText(sym, price, expiries){
   if(first.pc_oi!=null) txt+=`<b>P/C OI:</b> ${first.pc_oi.toFixed(2)} — ${first.pc_oi>1.2?'más puts que calls: posicionamiento defensivo/bajista.':first.pc_oi<0.7?'más calls que puts: optimismo/especulación alcista.':'posicionamiento mixto/neutro.'} `;
   return txt?`<div class="opt-insight">${txt}</div>`:'';
 }
-
 async function renderOptions(){
   document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Cargando cadena de opciones...</div>';
   let j;
   try{ j=await(await fetch('/api/options')).json(); }
   catch(e){ document.getElementById('root').innerHTML=`<div class="mkt-loading">⚠ Error: ${e.message}</div>`; return; }
-
   const data=j.data||{};
   if(!Object.keys(data).length){
     document.getElementById('root').innerHTML='<div class="mkt-loading">⏳ Calculando datos de opciones por primera vez (~3min)…<br><small style="color:#304050">SPY·SLV·GGAL: CBOE via yfinance — BTC: Deribit</small></div>';
     setTimeout(renderOptions,14000); return;
   }
-
   let html=`<div class="opt-wrap">
   <div style="padding:0 0 8px;font-size:.68rem;color:#1e3040">
     Actualizado: ${j.updated_at||'—'} &nbsp;·&nbsp;
     <span style="cursor:pointer;color:#2a6aaa" onclick="renderOptions()">↻ Refrescar</span>
     &nbsp;·&nbsp; SPY·SLV·GGAL: CBOE · BTC: Deribit
   </div>
-
   <div class="opt-insight" style="margin-bottom:12px;font-size:.70rem;color:#507090;line-height:1.6">
     <b>Guía rápida —</b>
     <b>Max Pain:</b> strike donde el total de pérdidas de writers es mínimo; el precio tiende a "pinear" ahí antes del vencimiento. &nbsp;
@@ -2736,9 +2543,7 @@ async function renderOptions(){
     <b>Flow:</b> heurístico bid/ask/last — 🟢 <b>COMPRADA</b> = última operación cerca del ask (comprador inicia) · 🔴 <b>VENDIDA</b> = cerca del bid (vendedor inicia). &nbsp;
     <b>P/C &lt;0.7</b>=alcista · <b>&gt;1.1</b>=bajista. &nbsp; <b>🔵 Mensual · 🟡 Trimestral</b> = vencimientos grandes, mayor poder de pinning.
   </div>
-
   <div class="opt-ticker-grid">`;
-
   const TICKER_ORDER=['SPY','BTC','SLV','GGAL'];
   TICKER_ORDER.forEach(sym=>{
     const d=data[sym];
@@ -2750,12 +2555,10 @@ async function renderOptions(){
         </div></div>`;
       return;
     }
-
     const price=d.price;
     const fmtP = p => p==null?'—': p>=1000?p.toFixed(0): p>=100?p.toFixed(2): p.toFixed(4);
     const priceStr=price!=null?`<span class="opt-price-big">${fmtP(price)}</span>`:'';
     const unitNote=d.oi_unit?`<span style="font-size:.60rem;color:#2a4050;margin-left:6px">(OI en ${d.oi_unit})</span>`:'';
-
     // ── Expiry table ─────────────────────────────────────────────────
     let expTbl=`<div class="opt-section-lbl">Próximos Vencimientos ${unitNote}</div>
     <div class="opt-tbl-scroll"><table class="opt-table"><thead><tr>
@@ -2783,7 +2586,6 @@ async function renderOptions(){
       </tr>`;
     });
     expTbl+='</tbody></table></div>';
-
     // ── Key OI levels (first expiry) — OI + flow combined per cell ─────
     const firstExp=(d.expiries||[])[0];
     let levelsHtml='';
@@ -2837,7 +2639,6 @@ async function renderOptions(){
       });
       levelsHtml+='</tbody></table></div>';
     }
-
     html+=`<div class="opt-card">
       <div class="opt-card-hdr">
         <div>
@@ -2851,13 +2652,11 @@ async function renderOptions(){
       ${insightText(sym, price, d.expiries||[])}
     </div>`;
   });
-
   html+=`</div></div>`;
   document.getElementById('root').innerHTML=html;
 }
-
 /* ── fetch ── */
-// FIX: tabs que usan renderAll() — market/mining/options tienen sus propios renderers
+// Tabs that use renderAll() — market/mining/options have their own renderers
 const STOCK_TABS = new Set(['prices','valuation','growth','technical','analysts']);
 let _fetchErrCount=0;
 async function refresh(){
@@ -2875,35 +2674,34 @@ async function refresh(){
     if(liveN>0){lel.textContent=`🟢 LIVE ${liveN}/${j.data.length}`;lel.style.display='';}
     else lel.style.display='none';
     document.getElementById('updated').textContent=j.updated_at;
-    // FIX: solo llamar renderAll() para tabs que están en STOCK_TABS
-    // (mining/options/market tienen sus propios render functions — llamar renderAll()
-    //  en ellas crashea con TypeError porque TABS[tab] es undefined)
+    // FIX: only call renderAll() for tabs that are in TABS dict
+    // (market/mining/options have their own render functions — calling renderAll()
+    //  on them crashes with TypeError because TABS[tab] is undefined)
     if(STOCK_TABS.has(activeTab)) renderAll();
   }catch(e){
     if(!fetchOk){
+      // Real fetch/network error
       _fetchErrCount++;
       const el=document.getElementById('updated');
       if(el) el.textContent=`⚠ Sin conexión (${_fetchErrCount}x) — reintentando...`;
       if(_fetchErrCount>=10) window.location.reload();
     } else {
-      console.warn('refresh render error:',e.message);
+      // Render error — don't penalise the fetch counter
+      console.warn('refresh render error:', e.message);
     }
   }
 }
-
 refresh();
 setInterval(refresh,POLL);
 setInterval(()=>{ if(activeTab==='market') renderMarket(); }, 60000);
 setInterval(()=>{ if(activeTab==='mining') renderMining(); }, 120000);
 setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
 </script>
-
 <!-- Feature Pack: Portfolio Simulator | Position Size Calculator | Export CSV | Ticker Tape -->
 <script>
 (function() {
   'use strict';
   if (document.getElementById('mf-css')) return;
-
   var s = document.createElement('style');
   s.id = 'mf-css';
   s.textContent = [
@@ -2945,19 +2743,17 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     '.cri .vl{font-size:18px;font-weight:700;margin-top:2px;color:#f093fb}',
     '.et{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:#1a2d45;color:#92fe9d;padding:12px 24px;border-radius:10px;font-size:14px;z-index:99999;opacity:0;transition:opacity .3s;border:1px solid #00c9ff}',
     '.et.sh{opacity:1}'
-  ].join('\\n');
+  ].join('\n');
   document.head.appendChild(s);
-
   var fc = document.createElement('div');
   fc.className = 'fab-c';
-  fc.innerHTML = '<button class="fab-b" id="fb-p" style="background:linear-gradient(135deg,#00c9ff,#92fe9d)"><span class="ft">Portfolio Simulator</span>P</button>' +
-    '<button class="fab-b" id="fb-c" style="background:linear-gradient(135deg,#f093fb,#f5576c)"><span class="ft">Position Sizer</span>C</button>' +
-    '<button class="fab-b" id="fb-e" style="background:linear-gradient(135deg,#ffd86f,#fc6262)"><span class="ft">Exportar CSV</span>E</button>';
+  fc.innerHTML = '<button class="fab-b" id="fb-p" style="background:linear-gradient(135deg,#00c9ff,#92fe9d)"><span class="ft">Portfolio Simulator</span>\uD83D\uDCBC</button>' +
+    '<button class="fab-b" id="fb-c" style="background:linear-gradient(135deg,#f093fb,#f5576c)"><span class="ft">Position Sizer</span>\uD83D\uDCD0</button>' +
+    '<button class="fab-b" id="fb-e" style="background:linear-gradient(135deg,#ffd86f,#fc6262)"><span class="ft">Exportar CSV</span>\uD83D\uDCE5</button>';
   document.body.appendChild(fc);
-
   var po = document.createElement('div'); po.className = 'mo'; po.id = 'po'; document.body.appendChild(po);
   var pp = document.createElement('div'); pp.className = 'mp'; pp.id = 'pp'; pp.style.width = '720px';
-  pp.innerHTML = '<div class="mh"><h2 style="color:#00c9ff">P Portfolio Simulator</h2><button class="mc" id="pc">&times;</button></div>' +
+  pp.innerHTML = '<div class="mh"><h2 style="color:#00c9ff">\uD83D\uDCBC Portfolio Simulator</h2><button class="mc" id="pc">&times;</button></div>' +
     '<div class="mb"><div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">' +
     '<input class="pi" type="text" id="pt" placeholder="Ticker (ej: AAPL)" style="width:120px">' +
     '<input class="pi" type="number" id="pq" placeholder="Acciones" style="width:100px" min="1">' +
@@ -2971,31 +2767,27 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     '<div class="pst"><div class="psl">P&L Total</div><div class="psv" id="sp">$0</div></div>' +
     '<div class="pst"><div class="psl">Retorno</div><div class="psv" id="sr">0%</div></div></div>';
   document.body.appendChild(pp);
-
   var co = document.createElement('div'); co.className = 'mo'; co.id = 'co'; document.body.appendChild(co);
   var cp = document.createElement('div'); cp.className = 'mp'; cp.id = 'cp'; cp.style.width = '520px';
-  cp.innerHTML = '<div class="mh"><h2 style="color:#f093fb">C Position Size Calculator</h2><button class="mc" id="cc">&times;</button></div>' +
+  cp.innerHTML = '<div class="mh"><h2 style="color:#f093fb">\uD83D\uDCD0 Position Size Calculator</h2><button class="mc" id="cc">&times;</button></div>' +
     '<div class="mb"><div class="cg">' +
     '<div class="cf"><label>Capital Total ($)</label><input type="number" id="c1" value="10000" step="100"></div>' +
     '<div class="cf"><label>Riesgo por Trade (%)</label><input type="number" id="c2" value="2" step="0.5"></div>' +
     '<div class="cf"><label>Precio Entrada ($)</label><input type="number" id="c3" placeholder="ej: 150.00" step="0.01"></div>' +
     '<div class="cf"><label>Stop Loss ($)</label><input type="number" id="c4" placeholder="ej: 145.00" step="0.01"></div></div>' +
     '<div class="cr" id="cres" style="display:none"><div style="font-size:13px;color:#8899aa;text-transform:uppercase;letter-spacing:1px">Resultado</div>' +
-    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">—</div></div>' +
-    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">—</div></div>' +
-    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">—</div></div></div>' +
-    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">—</div></div>' +
-    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">—</div></div>' +
-    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">—</div></div></div></div></div>';
+    '<div class="crg"><div class="cri"><div class="lb">Acciones</div><div class="vl" id="r1">\u2014</div></div>' +
+    '<div class="cri"><div class="lb">Monto a Invertir</div><div class="vl" id="r2">\u2014</div></div>' +
+    '<div class="cri"><div class="lb">Riesgo $</div><div class="vl" id="r3">\u2014</div></div></div>' +
+    '<div class="crg" style="margin-top:12px"><div class="cri"><div class="lb">R:R 2:1 Target</div><div class="vl" id="r4" style="color:#00e676">\u2014</div></div>' +
+    '<div class="cri"><div class="lb">R:R 3:1 Target</div><div class="vl" id="r5" style="color:#00e676">\u2014</div></div>' +
+    '<div class="cri"><div class="lb">% del Capital</div><div class="vl" id="r6">\u2014</div></div></div></div></div>';
   document.body.appendChild(cp);
-
   var toast = document.createElement('div');
   toast.className = 'et'; toast.id = 'toast';
   toast.textContent = 'CSV exportado exitosamente';
   document.body.appendChild(toast);
-
   window._pf = [];
-
   window.findPrice = function(tk) {
     var tables = document.querySelectorAll('.table-wrap table');
     var up = tk.toUpperCase();
@@ -3014,16 +2806,13 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     }
     return null;
   };
-
   function tog(pid, oid) {
     document.getElementById(pid).classList.toggle('op');
     document.getElementById(oid).classList.toggle('op');
   }
-
   document.getElementById('fb-p').onclick = function() { tog('pp', 'po'); upPF(); };
   document.getElementById('po').onclick = function() { tog('pp', 'po'); };
   document.getElementById('pc').onclick = function() { tog('pp', 'po'); };
-
   window.upPF = function() {
     var tb = document.getElementById('ptb');
     if (!tb) return;
@@ -3051,7 +2840,6 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     document.getElementById('sr').textContent = (tr >= 0 ? '+' : '') + tr.toFixed(2) + '%';
     document.getElementById('sr').className = 'psv ' + c;
   };
-
   document.getElementById('padd').onclick = function() {
     var t = document.getElementById('pt').value.toUpperCase().trim();
     var q = parseInt(document.getElementById('pq').value);
@@ -3064,11 +2852,9 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     upPF();
   };
   window.rmPF = function(i) { window._pf.splice(i, 1); upPF(); };
-
   document.getElementById('fb-c').onclick = function() { tog('cp', 'co'); };
   document.getElementById('co').onclick = function() { tog('cp', 'co'); };
   document.getElementById('cc').onclick = function() { tog('cp', 'co'); };
-
   function calc() {
     var cap = parseFloat(document.getElementById('c1').value);
     var rp = parseFloat(document.getElementById('c2').value);
@@ -3088,7 +2874,6 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
   ['c1', 'c2', 'c3', 'c4'].forEach(function(id) {
     document.getElementById(id).addEventListener('input', calc);
   });
-
   document.getElementById('fb-e').onclick = function() {
     var rows = document.querySelectorAll('.table-wrap tr');
     var csv = [];
@@ -3101,7 +2886,7 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
       }
     });
     if (csv.length < 2) return;
-    var blob = new Blob([csv.join('\\n')], { type: 'text/csv' });
+    var blob = new Blob([csv.join('\n')], { type: 'text/csv' });
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'stocks_' + new Date().toISOString().slice(0, 10) + '.csv';
@@ -3110,13 +2895,11 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     t.classList.add('sh');
     setTimeout(function() { t.classList.remove('sh'); }, 2500);
   };
-
   var host = document.createElement('div');
   host.id = 'tape-h';
   host.setAttribute('style', 'position:fixed !important;bottom:0 !important;left:0 !important;right:0 !important;height:38px !important;z-index:999999 !important;');
   document.documentElement.appendChild(host);
   var shadow = host.attachShadow({ mode: 'open' });
-
   function renderTape() {
     var stocks = [], seen = {};
     var tables = document.querySelectorAll('.table-wrap table');
@@ -3125,7 +2908,7 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
       for (var r = 0; r < rows.length; r++) {
         var tds = rows[r].querySelectorAll('td');
         if (tds.length < 8) continue;
-        var tk = tds[2] ? tds[2].textContent.trim().split(' ')[0].split('\\n')[0] : '';
+        var tk = tds[2] ? tds[2].textContent.trim().split(' ')[0].split('\n')[0] : '';
         if (!tk || seen[tk]) continue;
         seen[tk] = true;
         var price = tds[5] ? tds[5].textContent.trim() : '';
@@ -3138,7 +2921,7 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
     var all = stocks.concat(stocks).concat(stocks);
     var sp = '';
     all.forEach(function(s) {
-      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '▲' : '▼';
+      var col = s.u ? '#00e676' : '#ff5252', arr = s.u ? '\u25B2' : '\u25BC';
       sp += '<span style="display:inline-block;margin-right:30px;font-size:13px;font-family:Segoe UI,sans-serif;"><b style="color:#00c9ff;">' + s.t + '</b> <span style="color:#dce8f0;">' + s.p + '</span> <span style="color:' + col + ';">' + arr + ' ' + s.c + '</span></span>';
     });
     shadow.innerHTML = '<style>@keyframes sc{0%{transform:translateX(0)}100%{transform:translateX(-66.66%)}}</style>' +
@@ -3147,31 +2930,24 @@ setInterval(()=>{ if(activeTab==='options') renderOptions(); }, 180000);
   }
   renderTape();
   setInterval(renderTape, 15000);
-
   console.log('Stock Dashboard Feature Pack loaded!');
 })();
 </script>
 </body>
 </html>"""
-
 if __name__=='__main__':
-    print("="*58)
-    print("  USA Stock Dashboard  —  Finnhub Real-Time")
+    print("="*60)
+    print("  USA Stock Dashboard  —  yfinance Polling (sin Finnhub)")
     print(f"  Puerto: {PORT}")
-    print(f"  {len(ALL_TICKERS)} tickers  |  WS tiempo real  |  refresh {POLL_MS//1000}s")
-    print("="*58)
+    print(f"  {len(ALL_TICKERS)} tickers  |  polling c/{PRICE_POLL_S}s  |  frontend refresh {POLL_MS//1000}s")
+    print("="*60)
     # Todos los datos cargan en background — Flask arranca PRIMERO
     # para que Render/cloud reciba el health-check sin timeout
     threading.Thread(target=load_fundamentals, daemon=True).start()
-    time.sleep(15)  # stagger startup to avoid memory spike
     threading.Thread(target=load_technicals,   daemon=True).start()
-    time.sleep(10)
     threading.Thread(target=load_sparklines,   daemon=True).start()
-    time.sleep(10)
     threading.Thread(target=load_market_data,  daemon=True).start()
-    time.sleep(10)
     threading.Thread(target=load_mining_data,  daemon=True).start()
-    time.sleep(15)
     threading.Thread(target=load_options_data, daemon=True).start()
     threading.Thread(target=fundamentals_loop, daemon=True).start()
     threading.Thread(target=technicals_loop,   daemon=True).start()
@@ -3179,7 +2955,7 @@ if __name__=='__main__':
     threading.Thread(target=market_loop,       daemon=True).start()
     threading.Thread(target=mining_loop,       daemon=True).start()
     threading.Thread(target=options_loop,      daemon=True).start()
-    threading.Thread(target=start_ws,          daemon=True).start()
+    threading.Thread(target=price_poll_loop,   daemon=True).start()  # reemplaza WebSocket Finnhub
     # Solo abre el navegador si estamos corriendo localmente
     if not os.environ.get("PORT"):
         threading.Timer(3.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
